@@ -1,0 +1,385 @@
+"""
+Rainbow DQN Implementation
+Combines all 6 enhancements from the MOOO-RDQN paper:
+
+1. Double Q-Learning
+2. Prioritized Experience Replay
+3. Dueling Networks
+4. Multi-Step Learning (n-step returns)
+5. Noisy Networks
+6. Distributional RL (C51)
+
+Based on: "Rainbow: Combining Improvements in Deep Reinforcement Learning"
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Tuple
+import random
+from collections import deque
+
+
+class NoisyLinear(nn.Module):
+    """
+    Noisy Networks for Exploration (Component 5)
+    Replaces epsilon-greedy with learned exploration
+    """
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.sigma_init = sigma_init
+        
+        # Learnable parameters
+        self.weight_mu = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.FloatTensor(out_features))
+        self.bias_sigma = nn.Parameter(torch.FloatTensor(out_features))
+        
+        # Factorized Gaussian noise
+        self.register_buffer('weight_epsilon', torch.FloatTensor(out_features, in_features))
+        self.register_buffer('bias_epsilon', torch.FloatTensor(out_features))
+        
+        self.reset_parameters()
+        self.reset_noise()
+    
+    def reset_parameters(self):
+        mu_range = 1 / np.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        
+        self.weight_sigma.data.fill_(self.sigma_init / np.sqrt(self.in_features))
+        self.bias_sigma.data.fill_(self.sigma_init / np.sqrt(self.out_features))
+    
+    def reset_noise(self):
+        """Sample new noise"""
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        
+        self.weight_epsilon.copy_(epsilon_out.outer(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+    
+    def _scale_noise(self, size):
+        """Factorized Gaussian noise"""
+        x = torch.randn(size)
+        return x.sign().mul(x.abs().sqrt())
+    
+    def forward(self, x):
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        
+        return F.linear(x, weight, bias)
+
+
+class DuelingNetwork(nn.Module):
+    """
+    Dueling Network Architecture (Component 3)
+    Separates state-value and advantage estimation
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=256, n_atoms=51, v_min=-10, v_max=10):
+        super().__init__()
+        self.action_dim = action_dim
+        self.n_atoms = n_atoms
+        self.v_min = v_min
+        self.v_max = v_max
+        
+        # Shared feature extraction
+        self.feature = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Value stream (V(s))
+        self.value_stream = nn.Sequential(
+            NoisyLinear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            NoisyLinear(hidden_dim, n_atoms)  # Distributional RL
+        )
+        
+        # Advantage stream (A(s,a))
+        self.advantage_stream = nn.Sequential(
+            NoisyLinear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            NoisyLinear(hidden_dim, action_dim * n_atoms)  # Distributional RL
+        )
+        
+        # Support for distributional RL
+        self.register_buffer('support', torch.linspace(v_min, v_max, n_atoms))
+    
+    def forward(self, state):
+        """
+        Forward pass combining dueling architecture with distributional RL
+        Returns distribution over returns for each action
+        """
+        batch_size = state.size(0)
+        
+        # Shared features
+        features = self.feature(state)
+        
+        # Value distribution
+        value = self.value_stream(features).view(batch_size, 1, self.n_atoms)
+        
+        # Advantage distribution
+        advantage = self.advantage_stream(features).view(batch_size, self.action_dim, self.n_atoms)
+        
+        # Combine using dueling architecture
+        # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        q_dist = value + advantage - advantage.mean(dim=1, keepdim=True)
+        
+        # Apply softmax to get probability distribution
+        q_dist = F.softmax(q_dist, dim=2)
+        
+        return q_dist
+    
+    def get_q_values(self, state):
+        """Get expected Q-values (for action selection)"""
+        q_dist = self.forward(state)
+        # Expected value: sum(prob * support)
+        q_values = (q_dist * self.support.view(1, 1, -1)).sum(dim=2)
+        return q_values
+    
+    def reset_noise(self):
+        """Reset noise in all noisy layers"""
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
+
+class PrioritizedReplayBuffer:
+    """
+    Prioritized Experience Replay (Component 2)
+    Samples important transitions more frequently
+    """
+    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
+        self.capacity = capacity
+        self.alpha = alpha  # Priority exponent
+        self.beta_start = beta_start  # Importance sampling exponent
+        self.beta_frames = beta_frames
+        self.frame = 1
+        
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros(capacity, dtype=np.float32)
+    
+    def beta_by_frame(self, frame_idx):
+        """Anneal beta from beta_start to 1.0"""
+        return min(1.0, self.beta_start + frame_idx * (1.0 - self.beta_start) / self.beta_frames)
+    
+    def push(self, state, action, reward, next_state, done):
+        """Add experience with maximum priority"""
+        max_priority = self.priorities.max() if self.buffer else 1.0
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        
+        self.priorities[self.pos] = max_priority
+        self.pos = (self.pos + 1) % self.capacity
+    
+    def sample(self, batch_size):
+        """Sample batch with priorities"""
+        if len(self.buffer) == self.capacity:
+            priorities = self.priorities
+        else:
+            priorities = self.priorities[:self.pos]
+        
+        # Calculate sampling probabilities
+        probs = priorities ** self.alpha
+        probs /= probs.sum()
+        
+        # Sample indices
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
+        
+        # Calculate importance sampling weights
+        beta = self.beta_by_frame(self.frame)
+        self.frame += 1
+        
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        
+        # Get samples
+        samples = [self.buffer[idx] for idx in indices]
+        
+        states = torch.FloatTensor([s[0] for s in samples])
+        actions = torch.LongTensor([s[1] for s in samples])
+        rewards = torch.FloatTensor([s[2] for s in samples])
+        next_states = torch.FloatTensor([s[3] for s in samples])
+        dones = torch.FloatTensor([s[4] for s in samples])
+        weights = torch.FloatTensor(weights)
+        
+        return states, actions, rewards, next_states, dones, indices, weights
+    
+    def update_priorities(self, indices, priorities):
+        """Update priorities of sampled transitions"""
+        for idx, priority in zip(indices, priorities):
+            self.priorities[idx] = priority + 1e-5  # Small constant to avoid zero priority
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class RainbowDQN:
+    """
+    Complete Rainbow DQN Implementation
+    Combines all 6 components
+    """
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim=256,
+        lr=1e-4,
+        gamma=0.99,
+        n_step=3,  # Multi-step learning
+        buffer_size=100000,
+        batch_size=128,
+        n_atoms=51,
+        v_min=-10,
+        v_max=10,
+        device='cpu'
+    ):
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.n_step = n_step
+        self.batch_size = batch_size
+        self.device = device
+        self.n_atoms = n_atoms
+        
+        # Networks
+        self.online_net = DuelingNetwork(state_dim, action_dim, hidden_dim, n_atoms, v_min, v_max).to(device)
+        self.target_net = DuelingNetwork(state_dim, action_dim, hidden_dim, n_atoms, v_min, v_max).to(device)
+        self.target_net.load_state_dict(self.online_net.state_dict())
+        self.target_net.eval()
+        
+        # Optimizer
+        self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=lr)
+        
+        # Replay buffer (prioritized)
+        self.memory = PrioritizedReplayBuffer(buffer_size)
+        
+        # N-step buffer
+        self.n_step_buffer = deque(maxlen=n_step)
+        
+        # Support for distributional RL
+        self.support = torch.linspace(v_min, v_max, n_atoms).to(device)
+        self.delta_z = (v_max - v_min) / (n_atoms - 1)
+    
+    def select_action(self, state, training=True):
+        """Select action using noisy networks (no epsilon-greedy needed)"""
+        self.online_net.train(training)
+        
+        with torch.no_grad():
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            q_values = self.online_net.get_q_values(state)
+            action = q_values.argmax(dim=1).item()
+        
+        return action
+    
+    def push_n_step(self, state, action, reward, next_state, done):
+        """Add transition to n-step buffer"""
+        self.n_step_buffer.append((state, action, reward, next_state, done))
+        
+        if len(self.n_step_buffer) < self.n_step:
+            return
+        
+        # Calculate n-step return
+        n_step_state, n_step_action = self.n_step_buffer[0][:2]
+        n_step_reward = sum([self.gamma**i * t[2] for i, t in enumerate(self.n_step_buffer)])
+        n_step_next_state, n_step_done = self.n_step_buffer[-1][3:]
+        
+        # Add to replay buffer
+        self.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
+    
+    def train_step(self):
+        """Training step using all Rainbow components"""
+        if len(self.memory) < self.batch_size:
+            return None
+        
+        # Sample from prioritized replay buffer
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(self.batch_size)
+        
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+        weights = weights.to(self.device)
+        
+        # Current Q distribution
+        q_dist = self.online_net(states)
+        q_dist = q_dist[range(self.batch_size), actions]
+        
+        # Double Q-Learning: use online network to select action
+        with torch.no_grad():
+            next_q_values = self.online_net.get_q_values(next_states)
+            next_actions = next_q_values.argmax(dim=1)
+            
+            # Use target network to evaluate
+            next_q_dist = self.target_net(next_states)
+            next_q_dist = next_q_dist[range(self.batch_size), next_actions]
+            
+            # Distributional Bellman update (C51)
+            Tz = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * (self.gamma ** self.n_step) * self.support.unsqueeze(0)
+            Tz = Tz.clamp(self.support[0], self.support[-1])
+            
+            # Project onto support
+            b = (Tz - self.support[0]) / self.delta_z
+            l = b.floor().long()
+            u = b.ceil().long()
+            
+            # Distribute probability
+            target_q_dist = torch.zeros_like(next_q_dist)
+            offset = torch.linspace(0, (self.batch_size - 1) * self.n_atoms, self.batch_size).long().unsqueeze(1).expand(self.batch_size, self.n_atoms).to(self.device)
+            
+            target_q_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_q_dist * (u.float() - b)).view(-1))
+            target_q_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_q_dist * (b - l.float())).view(-1))
+        
+        # Cross-entropy loss
+        loss = -(target_q_dist * q_dist.clamp(min=1e-5, max=1).log()).sum(dim=1)
+        
+        # Importance sampling weights
+        loss = (loss * weights).mean()
+        
+        # Update priorities
+        priorities = loss.detach().cpu().numpy()
+        self.memory.update_priorities(indices, priorities)
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10)
+        self.optimizer.step()
+        
+        # Reset noise
+        self.online_net.reset_noise()
+        self.target_net.reset_noise()
+        
+        return loss.item()
+    
+    def update_target_network(self):
+        """Hard update of target network"""
+        self.target_net.load_state_dict(self.online_net.state_dict())
+    
+    def save(self, path):
+        """Save model"""
+        torch.save({
+            'online_net': self.online_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict()
+        }, path)
+    
+    def load(self, path):
+        """Load model"""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.online_net.load_state_dict(checkpoint['online_net'])
+        self.target_net.load_state_dict(checkpoint['target_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
