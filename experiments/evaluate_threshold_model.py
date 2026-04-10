@@ -1,495 +1,385 @@
 #!/usr/bin/env python3
 """
-Comprehensive Evaluation of Threshold-Based Proactive System
+Evaluate Rainbow checkpoints with the same environment family used in training/testing.
 
-Evaluates:
-1. Proactive Behavior (Parking, Evoking, Migrations)
-2. Load Balancing Performance
-3. Energy Efficiency
-4. Latency Performance
-5. Comparison with MOOO-RDQN paper
+Focus:
+1. Paper-style metrics: controller-switch average latency, worst-case latency,
+   load-balance index, and training time when metadata is available.
+2. Consistent model loading for custom Rainbow `.pth` checkpoints.
+3. Optional valid-action masking to match the improved evaluation path.
 """
-import sys
+
+import json
 import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from stable_baselines3 import DQN
-import numpy as np
-import json
-from datetime import datetime
-import matplotlib.pyplot as plt
+from environments.rainbow_dqn_model import RainbowDQN
+from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
 
-# Add environments to path
-env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'environments')
-sys.path.insert(0, env_path)
 
-from threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
-
-# MOOO-RDQN paper results (2 controllers)
 PAPER_RESULTS = {
-    'gridnet': {'cs_avg_latency': 3.34, 'cs_worst_latency': 8.71, 'load_balance': 2.68},
-    'bellcanada': {'cs_avg_latency': 5.01, 'cs_worst_latency': 7.38, 'load_balance': 4.00},
-    'os3e': {'cs_avg_latency': 2.91, 'cs_worst_latency': 8.65, 'load_balance': 3.20},
-    'interoute': {'cs_avg_latency': 3.45, 'cs_worst_latency': 3.45, 'load_balance': 2.98},
-    'cogentco': {'cs_avg_latency': 7.88, 'cs_worst_latency': 16.37, 'load_balance': 6.45}
+    'gridnet': {'cs_avg_latency': 3.34, 'cs_worst_latency': 8.71, 'load_balance_index': 2.68},
+    'bellcanada': {'cs_avg_latency': 5.01, 'cs_worst_latency': 7.38, 'load_balance_index': 4.00},
+    'os3e': {'cs_avg_latency': 2.91, 'cs_worst_latency': 8.65, 'load_balance_index': 3.20},
+    'interoute': {'cs_avg_latency': 3.45, 'cs_worst_latency': 3.45, 'load_balance_index': 2.98},
+    'cogentco': {'cs_avg_latency': 7.88, 'cs_worst_latency': 16.37, 'load_balance_index': 6.45},
 }
 
-def evaluate_model(model_path, topology='gridnet', episodes=10, steps_per_episode=1000):
-    """
-    Comprehensive evaluation of trained model
-    
-    Returns detailed metrics on:
-    - Proactive behavior (parking, evoking, migrations)
-    - Load balancing (variance, threshold violations)
-    - Energy efficiency
-    - Latency performance
-    """
-    print(f"\n{'='*70}")
-    print(f"EVALUATING: {topology.upper()}")
-    print(f"{'='*70}\n")
-    
-    if not os.path.exists(model_path):
-        print(f"❌ Model not found: {model_path}")
-        return None
-    
-    # Load model
-    model = DQN.load(model_path)
-    
-    # Create environment
-    env = ThresholdBasedProactiveSDN(
-        topology_name=topology,
-        num_slave_controllers=3,
-        num_parked_controllers=2
+PAPER_RESULTS_STATUS = "UNVERIFIED_MANUAL_ENTRY"
+
+
+class RealTrafficEvaluationEnvironment(ThresholdBasedProactiveSDN):
+    """Use processed traffic traces instead of synthetic day/night sampling."""
+
+    def __init__(self, traffic_data, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.real_traffic_data = traffic_data
+        self.traffic_index = 0
+        self.max_traffic_steps = len(traffic_data)
+
+    def _simulate_traffic_variation(self):
+        if self.traffic_index >= self.max_traffic_steps:
+            self.traffic_index = 0
+
+        current_traffic = self.real_traffic_data[self.traffic_index]
+        self.traffic_index += 1
+        self.controller_loads = {i: 0.0 for i in range(self.total_controllers)}
+
+        for switch_id in range(self.num_switches):
+            controller_id = self.switch_to_controller[switch_id]
+            if controller_id in self.parked_slaves:
+                continue
+
+            if switch_id < len(current_traffic):
+                switch_load = current_traffic[switch_id]
+            else:
+                switch_load = current_traffic[switch_id % len(current_traffic)]
+
+            self.controller_loads[controller_id] += switch_load
+
+        for controller_id in self.active_slaves:
+            num_assigned = sum(
+                1 for switch, assigned_controller in self.switch_to_controller.items()
+                if assigned_controller == controller_id
+            )
+            if num_assigned > 0:
+                self.controller_loads[controller_id] /= num_assigned
+                self.controller_loads[controller_id] = np.clip(self.controller_loads[controller_id], 0, 1)
+
+
+def apply_training_reward_logic(env):
+    """Match the aggressive reward shaping used in training."""
+    def fixed_calculate_reward(action_type: str, success: bool):
+        latency = env._calculate_latency()
+        worst_case_latency = env._calculate_worst_case_latency()
+        energy = env._calculate_energy()
+        load_variance = env._calculate_load_variance()
+        load_balance_index = env._calculate_load_balance_index()
+
+        norm_latency = latency / 20.0
+        norm_energy = energy / 1000.0
+        norm_load_var = load_variance / 1.0
+        reward = -1.0 * norm_latency - 2.0 * norm_energy - 1.0 * norm_load_var
+
+        if action_type == 'park' and success:
+            reward += 200.0
+        elif action_type == 'evoke' and success:
+            reward += 150.0
+        elif action_type == 'migrate' and success:
+            reward += 2.0
+
+        thresholds = env._check_thresholds()
+        if action_type == 'noop':
+            if thresholds['overloaded']:
+                reward -= 100.0
+            if thresholds['underloaded'] and len(env.parked_slaves) < env.num_parked_controllers:
+                reward -= 80.0
+
+        if not success and action_type != 'noop':
+            reward -= 10.0
+
+        return reward, {
+            'latency': latency,
+            'cs_avg_latency': latency,
+            'worst_case_latency': worst_case_latency,
+            'cs_worst_latency': worst_case_latency,
+            'energy': energy,
+            'load_variance': load_variance,
+            'load_balance_index': load_balance_index,
+            'active_controllers': len(env.active_slaves),
+            'parked_controllers': len(env.parked_slaves),
+            'action_type': action_type,
+            'action_success': success,
+            'overloaded_count': len(thresholds['overloaded']),
+            'underloaded_count': len(thresholds['underloaded']),
+        }
+
+    env._calculate_reward = fixed_calculate_reward
+
+
+def load_rainbow_model(model_path: str):
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    if isinstance(checkpoint, dict):
+        state_dim = checkpoint.get('state_dim')
+        action_dim = checkpoint.get('action_dim')
+        hidden_dim = None
+
+        if 'hyperparameters' in checkpoint:
+            hidden_dim = checkpoint['hyperparameters'].get('hidden_dim')
+
+        if hidden_dim is None and 'online_net' in checkpoint and 'feature.0.weight' in checkpoint['online_net']:
+            hidden_dim = checkpoint['online_net']['feature.0.weight'].shape[0]
+
+        if state_dim is None or action_dim is None:
+            if 'online_net' in checkpoint and 'feature.0.weight' in checkpoint['online_net']:
+                state_dim = checkpoint['online_net']['feature.0.weight'].shape[1]
+                hidden_dim = checkpoint['online_net']['feature.0.weight'].shape[0]
+            adv_keys = [
+                key for key in checkpoint.get('online_net', {})
+                if 'advantage_stream.2' in key and 'weight_mu' in key
+            ]
+            if action_dim is None and adv_keys:
+                action_dim = checkpoint['online_net'][adv_keys[0]].shape[0] // 51
+    else:
+        raise ValueError("Unsupported checkpoint format")
+
+    if hidden_dim is None:
+        hidden_dim = 256
+
+    model = RainbowDQN(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        hidden_dim=hidden_dim,
+        lr=1e-4,
+        gamma=0.99,
+        n_step=3,
+        device='cpu',
     )
-    
-    # Metrics storage
+    model.online_net.load_state_dict(checkpoint['online_net'])
+    model.online_net.eval()
+    return model, checkpoint
+
+
+def select_action(model, state, env, mask_invalid_actions: bool):
+    model.online_net.train(False)
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(model.device)
+        q_values = model.online_net.get_q_values(state_tensor).squeeze(0)
+        raw_action = int(q_values.argmax().item())
+
+        if not mask_invalid_actions:
+            return raw_action, raw_action
+
+        valid_actions = env.get_valid_actions()
+        masked_q_values = q_values.clone()
+        invalid_actions = torch.ones_like(masked_q_values, dtype=torch.bool)
+        invalid_actions[valid_actions] = False
+        masked_q_values[invalid_actions] = -torch.inf
+        chosen_action = int(masked_q_values.argmax().item())
+        return raw_action, chosen_action
+
+
+def evaluate_model(
+    model_path: str,
+    topology: str = 'gridnet',
+    episodes: int = 10,
+    steps_per_episode: int = 500,
+    mask_invalid_actions: bool = False,
+    traffic_path: str | None = None,
+):
+    model_path = Path(model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    model, checkpoint = load_rainbow_model(str(model_path))
+    metadata_path = model_path.with_name(model_path.stem.replace('LATEST_', '') + '_metadata.json')
+    metadata = None
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text())
+
+    traffic_data = None
+    if traffic_path:
+        traffic_path = Path(traffic_path)
+        if traffic_path.exists():
+            traffic_data = np.load(traffic_path)
+
+    if traffic_data is not None:
+        env = RealTrafficEvaluationEnvironment(
+            traffic_data=traffic_data,
+            topology_name=topology,
+            num_slave_controllers=3,
+            num_parked_controllers=2,
+        )
+    else:
+        env = ThresholdBasedProactiveSDN(
+            topology_name=topology,
+            num_slave_controllers=3,
+            num_parked_controllers=2,
+        )
+
+    apply_training_reward_logic(env)
+
     metrics = {
-        # Proactive behavior
+        'cs_avg_latency': [],
+        'cs_worst_latency': [],
+        'load_balance_index': [],
+        'energy': [],
+        'reward': [],
         'parking_events': [],
         'evoking_events': [],
         'migration_events': [],
-        'park_evoke_ratio': [],
-        
-        # Load balancing
-        'load_variance': [],
-        'load_balance': [],
-        'overload_violations': [],
-        'underload_opportunities': [],
-        
-        # Energy
-        'energy_consumption': [],
-        'energy_savings': [],
-        'active_controllers_avg': [],
-        
-        # Latency
-        'avg_latency': [],
-        'worst_latency': [],
-        
-        # Rewards
-        'episode_rewards': [],
-        
-        # Time-series data for visualization
-        'hourly_data': []
+        'mask_overrides': 0,
     }
-    
-    print(f"Running {episodes} episodes...")
-    
-    for ep in range(episodes):
-        obs, _ = env.reset()
-        
-        # Episode metrics
-        ep_parking = 0
-        ep_evoking = 0
-        ep_migrations = 0
-        ep_load_vars = []
-        ep_overloads = []
-        ep_underloads = []
+
+    for _ in range(episodes):
+        state, _ = env.reset()
+        ep_reward = 0.0
+        ep_avg_latencies = []
+        ep_worst_latencies = []
+        ep_load_balance = []
         ep_energy = []
-        ep_latency = []
-        ep_worst_latency = []
-        ep_active = []
-        ep_reward = 0
-        
-        # Hourly tracking
-        hourly_loads = []
-        hourly_active = []
-        hourly_actions = []
-        
-        for step in range(steps_per_episode):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            
+        ep_park = 0
+        ep_evoke = 0
+        ep_migrate = 0
+
+        for _step in range(steps_per_episode):
+            raw_action, action = select_action(model, state, env, mask_invalid_actions)
+            if raw_action != action:
+                metrics['mask_overrides'] += 1
+
+            next_state, reward, terminated, truncated, info = env.step(action)
             ep_reward += reward
-            
-            # Track proactive actions
+            ep_avg_latencies.append(float(info.get('cs_avg_latency', info.get('latency', 0.0))))
+            ep_worst_latencies.append(float(info.get('cs_worst_latency', info.get('worst_case_latency', 0.0))))
+            ep_load_balance.append(float(info.get('load_balance_index', 0.0)))
+            ep_energy.append(float(info.get('energy', 0.0)))
+
             action_type = info.get('action_type', '')
             if 'park' in action_type and info.get('action_success'):
-                ep_parking += 1
+                ep_park += 1
             elif 'evoke' in action_type and info.get('action_success'):
-                ep_evoking += 1
+                ep_evoke += 1
             elif 'migrate' in action_type and info.get('action_success'):
-                ep_migrations += 1
-            
-            # Track metrics
-            ep_load_vars.append(info.get('load_variance', 0))
-            ep_overloads.append(info.get('overloaded_count', 0))
-            ep_underloads.append(info.get('underloaded_count', 0))
-            ep_energy.append(info.get('energy', 0))
-            ep_latency.append(info.get('latency', 0))
-            ep_active.append(info.get('active_controllers', 0))
-            
-            # Track hourly data (every 50 steps = 1 hour)
-            if step % 50 == 0:
-                hourly_loads.append(np.mean(ep_load_vars[-50:]) if ep_load_vars else 0)
-                hourly_active.append(info.get('active_controllers', 0))
-                hourly_actions.append({
-                    'park': ep_parking,
-                    'evoke': ep_evoking,
-                    'migrate': ep_migrations
-                })
-            
-            # Track worst case latency
-            if ep_latency:
-                ep_worst_latency.append(max(ep_latency))
-            
+                ep_migrate += 1
+
+            state = next_state
             if terminated or truncated:
                 break
-        
-        # Store episode metrics
-        metrics['parking_events'].append(ep_parking)
-        metrics['evoking_events'].append(ep_evoking)
-        metrics['migration_events'].append(ep_migrations)
-        
-        pe_ratio = ep_parking / ep_evoking if ep_evoking > 0 else 0
-        metrics['park_evoke_ratio'].append(pe_ratio)
-        
-        metrics['load_variance'].append(np.mean(ep_load_vars))
-        metrics['load_balance'].append(np.sqrt(np.mean(ep_load_vars)))
-        metrics['overload_violations'].append(np.mean(ep_overloads))
-        metrics['underload_opportunities'].append(np.mean(ep_underloads))
-        
-        metrics['energy_consumption'].append(np.mean(ep_energy))
-        
-        # Calculate energy savings vs all-active baseline
-        baseline_energy = 50 + 3 * 100  # Master + 3 active slaves
-        avg_energy = np.mean(ep_energy)
-        savings = (baseline_energy - avg_energy) / baseline_energy * 100
-        metrics['energy_savings'].append(savings)
-        
-        metrics['active_controllers_avg'].append(np.mean(ep_active))
-        metrics['avg_latency'].append(np.mean(ep_latency))
-        
-        if ep_worst_latency:
-            metrics['worst_latency'].append(np.mean(ep_worst_latency))
-        
-        metrics['episode_rewards'].append(ep_reward)
-        
-        metrics['hourly_data'].append({
-            'loads': hourly_loads,
-            'active': hourly_active,
-            'actions': hourly_actions
-        })
-        
-        print(f"  Episode {ep+1}/{episodes}: "
-              f"Park={ep_parking}, Evoke={ep_evoking}, Migrate={ep_migrations}, "
-              f"Energy={avg_energy:.0f}W, Latency={np.mean(ep_latency):.2f}ms")
-    
+
+        metrics['reward'].append(ep_reward)
+        metrics['cs_avg_latency'].append(float(np.mean(ep_avg_latencies)) if ep_avg_latencies else 0.0)
+        metrics['cs_worst_latency'].append(float(np.max(ep_worst_latencies)) if ep_worst_latencies else 0.0)
+        metrics['load_balance_index'].append(float(np.mean(ep_load_balance)) if ep_load_balance else 0.0)
+        metrics['energy'].append(float(np.mean(ep_energy)) if ep_energy else 0.0)
+        metrics['parking_events'].append(ep_park)
+        metrics['evoking_events'].append(ep_evoke)
+        metrics['migration_events'].append(ep_migrate)
+
     env.close()
-    
-    # Calculate summary statistics
+
     summary = {
         'topology': topology,
-        'num_switches': env.num_switches,
+        'model_path': str(model_path),
         'episodes': episodes,
-        
-        # Proactive behavior
-        'avg_parking_events': np.mean(metrics['parking_events']),
-        'avg_evoking_events': np.mean(metrics['evoking_events']),
-        'avg_migration_events': np.mean(metrics['migration_events']),
-        'avg_pe_ratio': np.mean(metrics['park_evoke_ratio']),
-        
-        # Load balancing
-        'avg_load_variance': np.mean(metrics['load_variance']),
-        'avg_load_balance': np.mean(metrics['load_balance']),
-        'avg_overload_violations': np.mean(metrics['overload_violations']),
-        'avg_underload_opportunities': np.mean(metrics['underload_opportunities']),
-        
-        # Energy
-        'avg_energy': np.mean(metrics['energy_consumption']),
-        'avg_energy_savings': np.mean(metrics['energy_savings']),
-        'avg_active_controllers': np.mean(metrics['active_controllers_avg']),
-        
-        # Latency
-        'avg_latency': np.mean(metrics['avg_latency']),
-        'worst_latency': np.mean(metrics['worst_latency']) if metrics['worst_latency'] else 0,
-        
-        # Overall
-        'avg_reward': np.mean(metrics['episode_rewards']),
-        
-        # Raw metrics for visualization
-        'raw_metrics': metrics
+        'steps_per_episode': steps_per_episode,
+        'mask_invalid_actions': bool(mask_invalid_actions),
+        'paper_results_status': PAPER_RESULTS_STATUS,
+        'training_time_seconds': float(metadata.get('training_time_seconds', 0.0)) if metadata else 0.0,
+        'cs_avg_latency': float(np.mean(metrics['cs_avg_latency'])),
+        'cs_worst_latency': float(np.mean(metrics['cs_worst_latency'])),
+        'load_balance_index': float(np.mean(metrics['load_balance_index'])),
+        'avg_energy': float(np.mean(metrics['energy'])),
+        'avg_reward': float(np.mean(metrics['reward'])),
+        'avg_parking_events': float(np.mean(metrics['parking_events'])),
+        'avg_evoking_events': float(np.mean(metrics['evoking_events'])),
+        'avg_migration_events': float(np.mean(metrics['migration_events'])),
+        'mask_overrides': int(metrics['mask_overrides']),
+        'raw_metrics': metrics,
     }
-    
+
+    if topology in PAPER_RESULTS:
+        paper = PAPER_RESULTS[topology]
+        summary['paper_reference'] = paper
+        summary['paper_deltas_pct'] = {
+            'cs_avg_latency': float((summary['cs_avg_latency'] - paper['cs_avg_latency']) / paper['cs_avg_latency'] * 100),
+            'cs_worst_latency': float((summary['cs_worst_latency'] - paper['cs_worst_latency']) / paper['cs_worst_latency'] * 100),
+            'load_balance_index': float((summary['load_balance_index'] - paper['load_balance_index']) / paper['load_balance_index'] * 100),
+        }
+
     return summary
 
+
 def print_evaluation_report(summary):
-    """Print comprehensive evaluation report"""
-    
     print(f"\n{'='*70}")
     print(f"EVALUATION REPORT: {summary['topology'].upper()}")
     print(f"{'='*70}\n")
-    
-    # Network info
-    print(f"Network Configuration:")
-    print(f"  Topology: {summary['topology']}")
-    print(f"  Number of switches: {summary['num_switches']}")
-    print(f"  Episodes evaluated: {summary['episodes']}")
-    
-    # Proactive behavior
-    print(f"\n{'='*70}")
-    print(f"1. PROACTIVE BEHAVIOR")
-    print(f"{'='*70}")
-    print(f"  Parking events per episode: {summary['avg_parking_events']:.1f}")
-    print(f"  Evoking events per episode: {summary['avg_evoking_events']:.1f}")
-    print(f"  Migration events per episode: {summary['avg_migration_events']:.1f}")
-    print(f"  Park/Evoke ratio: {summary['avg_pe_ratio']:.2f}")
-    
-    if summary['avg_parking_events'] > 100:
-        behavior_status = "✅ EXCELLENT - Very proactive!"
-    elif summary['avg_parking_events'] > 50:
-        behavior_status = "✅ GOOD - Proactive behavior learned"
-    elif summary['avg_parking_events'] > 10:
-        behavior_status = "⚠️  MODERATE - Some proactive behavior"
-    else:
-        behavior_status = "❌ POOR - Little proactive behavior"
-    
-    print(f"  Status: {behavior_status}")
-    
-    # Load balancing
-    print(f"\n{'='*70}")
-    print(f"2. LOAD BALANCING PERFORMANCE")
-    print(f"{'='*70}")
-    print(f"  Load variance: {summary['avg_load_variance']:.4f}")
-    print(f"  Load balance index: {summary['avg_load_balance']:.4f}")
-    print(f"  Avg overload violations: {summary['avg_overload_violations']:.2f}")
-    print(f"  Avg underload opportunities: {summary['avg_underload_opportunities']:.2f}")
-    
-    if summary['avg_load_balance'] < 0.1:
-        balance_status = "✅ EXCELLENT - Very balanced"
-    elif summary['avg_load_balance'] < 0.3:
-        balance_status = "✅ GOOD - Well balanced"
-    elif summary['avg_load_balance'] < 0.5:
-        balance_status = "⚠️  MODERATE - Somewhat balanced"
-    else:
-        balance_status = "❌ POOR - Imbalanced"
-    
-    print(f"  Status: {balance_status}")
-    
-    # Energy efficiency
-    print(f"\n{'='*70}")
-    print(f"3. ENERGY EFFICIENCY")
-    print(f"{'='*70}")
-    print(f"  Average energy consumption: {summary['avg_energy']:.2f} W")
-    print(f"  Average energy savings: {summary['avg_energy_savings']:.1f}%")
-    print(f"  Average active controllers: {summary['avg_active_controllers']:.2f}")
-    print(f"  Baseline (all active): 350 W")
-    
-    if summary['avg_energy_savings'] > 20:
-        energy_status = "✅ EXCELLENT - Significant savings"
-    elif summary['avg_energy_savings'] > 10:
-        energy_status = "✅ GOOD - Notable savings"
-    elif summary['avg_energy_savings'] > 5:
-        energy_status = "⚠️  MODERATE - Some savings"
-    else:
-        energy_status = "❌ POOR - Minimal savings"
-    
-    print(f"  Status: {energy_status}")
-    
-    # Latency
-    print(f"\n{'='*70}")
-    print(f"4. LATENCY PERFORMANCE")
-    print(f"{'='*70}")
-    print(f"  Average latency: {summary['avg_latency']:.2f} ms")
-    print(f"  Worst-case latency: {summary['worst_latency']:.2f} ms")
-    
-    # Compare with MOOO-RDQN if available
-    topo = summary['topology'].lower()
-    if topo in PAPER_RESULTS:
-        paper = PAPER_RESULTS[topo]
-        print(f"\n  Comparison with MOOO-RDQN paper:")
-        
-        diff_avg = ((paper['cs_avg_latency'] - summary['avg_latency']) / 
-                    paper['cs_avg_latency'] * 100)
-        status_avg = "✅ Better" if diff_avg > 0 else "⚠️  Higher"
-        print(f"    Avg latency: {summary['avg_latency']:.2f} ms vs {paper['cs_avg_latency']:.2f} ms "
-              f"({diff_avg:+.1f}%) {status_avg}")
-        
-        diff_worst = ((paper['cs_worst_latency'] - summary['worst_latency']) / 
-                     paper['cs_worst_latency'] * 100)
-        status_worst = "✅ Better" if diff_worst > 0 else "⚠️  Higher"
-        print(f"    Worst latency: {summary['worst_latency']:.2f} ms vs {paper['cs_worst_latency']:.2f} ms "
-              f"({diff_worst:+.1f}%) {status_worst}")
-        
-        diff_load = ((paper['load_balance'] - summary['avg_load_balance']) / 
-                    paper['load_balance'] * 100)
-        status_load = "✅ Better" if diff_load > 0 else "⚠️  Higher"
-        print(f"    Load balance: {summary['avg_load_balance']:.2f} vs {paper['load_balance']:.2f} "
-              f"({diff_load:+.1f}%) {status_load}")
-    
-    # Overall assessment
-    print(f"\n{'='*70}")
-    print(f"5. OVERALL ASSESSMENT")
-    print(f"{'='*70}")
-    print(f"  Average reward: {summary['avg_reward']:.2f}")
-    
-    # Count excellent/good ratings
-    ratings = [
-        summary['avg_parking_events'] > 50,  # Proactive
-        summary['avg_load_balance'] < 0.3,   # Load balance
-        summary['avg_energy_savings'] > 10,  # Energy
-    ]
-    
-    score = sum(ratings)
-    
-    if score >= 3:
-        overall = "✅ EXCELLENT - All objectives achieved!"
-    elif score >= 2:
-        overall = "✅ GOOD - Most objectives met"
-    elif score >= 1:
-        overall = "⚠️  MODERATE - Some objectives met"
-    else:
-        overall = "❌ NEEDS IMPROVEMENT"
-    
-    print(f"  Overall rating: {overall}")
-    print(f"  Score: {score}/3 objectives")
-    
-    print(f"\n{'='*70}\n")
+    print(f"Model: {summary['model_path']}")
+    print(f"Episodes: {summary['episodes']} | Steps/Episode: {summary['steps_per_episode']}")
+    print(f"Invalid action masking: {'ON' if summary['mask_invalid_actions'] else 'OFF'}")
+    print(f"Paper reference values: {summary['paper_results_status']}")
+    print()
+    print(f"CS average latency: {summary['cs_avg_latency']:.2f} ms")
+    print(f"CS worst-case latency: {summary['cs_worst_latency']:.2f} ms")
+    print(f"Load balance index: {summary['load_balance_index']:.4f}")
+    print(f"Training time: {summary['training_time_seconds']:.1f} s")
+    print(f"Average reward: {summary['avg_reward']:.2f}")
+    print(f"Average energy: {summary['avg_energy']:.2f} W")
+    print(f"Parking/Evoking/Migration per episode: "
+          f"{summary['avg_parking_events']:.1f} / {summary['avg_evoking_events']:.1f} / {summary['avg_migration_events']:.1f}")
+    print(f"Mask overrides: {summary['mask_overrides']}")
 
-def create_visualization(summary):
-    """Create visualization of results"""
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # Plot 1: Proactive Actions
-    ax = axes[0, 0]
-    actions = ['Parking', 'Evoking', 'Migrations']
-    values = [
-        summary['avg_parking_events'],
-        summary['avg_evoking_events'],
-        summary['avg_migration_events']
-    ]
-    ax.bar(actions, values, color=['green', 'blue', 'orange'])
-    ax.set_ylabel('Events per Episode')
-    ax.set_title('Proactive Actions', fontweight='bold')
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Plot 2: Energy Efficiency
-    ax = axes[0, 1]
-    baseline = 350
-    actual = summary['avg_energy']
-    ax.bar(['Baseline\n(All Active)', 'DRL Model'], [baseline, actual], 
-           color=['red', 'green'])
-    ax.set_ylabel('Energy (Watts)')
-    ax.set_title(f"Energy Efficiency ({summary['avg_energy_savings']:.1f}% savings)", 
-                 fontweight='bold')
-    ax.grid(axis='y', alpha=0.3)
-    
-    # Plot 3: Load Balance Over Episodes
-    ax = axes[1, 0]
-    episodes = range(1, len(summary['raw_metrics']['load_balance']) + 1)
-    ax.plot(episodes, summary['raw_metrics']['load_balance'], 'b-o', linewidth=2)
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Load Balance Index')
-    ax.set_title('Load Balance Performance', fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    
-    # Plot 4: Latency Comparison
-    ax = axes[1, 1]
-    if summary['topology'].lower() in PAPER_RESULTS:
-        paper = PAPER_RESULTS[summary['topology'].lower()]
-        metrics = ['Avg Latency', 'Worst Latency']
-        your_values = [summary['avg_latency'], summary['worst_latency']]
-        paper_values = [paper['cs_avg_latency'], paper['cs_worst_latency']]
-        
-        x = np.arange(len(metrics))
-        width = 0.35
-        
-        ax.bar(x - width/2, your_values, width, label='Your DRL', color='blue')
-        ax.bar(x + width/2, paper_values, width, label='MOOO-RDQN', color='orange')
-        
-        ax.set_ylabel('Latency (ms)')
-        ax.set_title('Latency Comparison with MOOO-RDQN', fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(metrics)
-        ax.legend()
-        ax.grid(axis='y', alpha=0.3)
-    else:
-        ax.text(0.5, 0.5, 'No comparison\ndata available', 
-               ha='center', va='center', fontsize=14)
-        ax.set_title('Latency Comparison', fontweight='bold')
-    
-    plt.tight_layout()
-    
-    # Save
-    output_dir = '../results/evaluations/'
-    os.makedirs(output_dir, exist_ok=True)
-    filename = f"{output_dir}evaluation_{summary['topology']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
-    
-    print(f"📊 Visualization saved: {filename}")
-    
-    try:
-        plt.show()
-    except:
-        pass
-    
-    plt.close()
+    if 'paper_reference' in summary:
+        print("\nComparison against stored paper reference values:")
+        print(f"  Paper CS average latency: {summary['paper_reference']['cs_avg_latency']:.2f} ms")
+        print(f"  Paper CS worst latency: {summary['paper_reference']['cs_worst_latency']:.2f} ms")
+        print(f"  Paper load balance index: {summary['paper_reference']['load_balance_index']:.2f}")
+        print(f"  Delta avg latency: {summary['paper_deltas_pct']['cs_avg_latency']:+.1f}%")
+        print(f"  Delta worst latency: {summary['paper_deltas_pct']['cs_worst_latency']:+.1f}%")
+        print(f"  Delta load balance: {summary['paper_deltas_pct']['load_balance_index']:+.1f}%")
+
 
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Evaluate threshold-based proactive system')
-    parser.add_argument('--topology', default='gridnet',
-                       choices=['gridnet', 'bellcanada', 'os3e', 'interoute', 'cogentco'])
-    parser.add_argument('--episodes', type=int, default=10,
-                       help='Number of episodes to evaluate')
-    parser.add_argument('--visualize', action='store_true',
-                       help='Create visualizations')
-    
-    args = parser.parse_args()
-    
-    model_path = f'../models/threshold_proactive_{args.topology}.zip'
-    
-    # Run evaluation
-    summary = evaluate_model(model_path, args.topology, args.episodes)
-    
-    if summary is None:
-        print("\n❌ Evaluation failed!")
-        print(f"Make sure model exists: {model_path}")
-        print(f"\nTrain first: python train_threshold_based.py --topology {args.topology}")
-        return
-    
-    # Print report
-    print_evaluation_report(summary)
-    
-    # Create visualization
-    if args.visualize:
-        create_visualization(summary)
-    
-    # Save results
-    results_dir = '../results/evaluations/'
-    os.makedirs(results_dir, exist_ok=True)
-    
-    results_file = f"{results_dir}eval_{args.topology}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    # Remove raw_metrics for cleaner JSON
-    summary_clean = {k: v for k, v in summary.items() if k != 'raw_metrics'}
-    
-    with open(results_file, 'w') as f:
-        json.dump(summary_clean, f, indent=2)
-    
-    print(f"💾 Results saved: {results_file}")
-    print()
 
-if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Evaluate Rainbow checkpoint with paper-style metrics')
+    parser.add_argument('--topology', default='gridnet',
+                        choices=['gridnet', 'bellcanada', 'os3e', 'interoute', 'cogentco'])
+    parser.add_argument('--model', help='Path to Rainbow checkpoint (.pth)')
+    parser.add_argument('--traffic', help='Optional real traffic .npy path')
+    parser.add_argument('--episodes', type=int, default=10)
+    parser.add_argument('--steps-per-episode', type=int, default=500)
+    parser.add_argument('--mask-invalid-actions', action='store_true')
+
+    args = parser.parse_args()
+
+    model_path = args.model or f'../models/LATEST_rainbow_proactive_{args.topology}.pth'
+    traffic_path = args.traffic or f'../data/traffic/processed/{args.topology}/{args.topology}_synthetic_traffic.npy'
+
+    summary = evaluate_model(
+        model_path=model_path,
+        topology=args.topology,
+        episodes=args.episodes,
+        steps_per_episode=args.steps_per_episode,
+        mask_invalid_actions=args.mask_invalid_actions,
+        traffic_path=traffic_path,
+    )
+    print_evaluation_report(summary)
+
+    results_dir = Path('../results/evaluations')
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_file = results_dir / f"eval_{args.topology}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    summary_clean = {key: value for key, value in summary.items() if key != 'raw_metrics'}
+    results_file.write_text(json.dumps(summary_clean, indent=2))
+    print(f"\nSaved: {results_file}")
+
+
+if __name__ == '__main__':
     main()

@@ -9,6 +9,8 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import networkx as nx
 
+from utils.topology_loader import TopologyLoader
+
 class ThresholdBasedProactiveSDN(gym.Env):
     """
     Proactive Load Balancing with Master-Slave-Parked Architecture
@@ -42,6 +44,9 @@ class ThresholdBasedProactiveSDN(gym.Env):
         self.overload_threshold = overload_threshold
         
         # Load topology
+        self.topology_loader = TopologyLoader()
+        self.controller_host_nodes = []
+        self.topology_info = None
         self._load_topology()
         
         # Controller IDs
@@ -82,16 +87,33 @@ class ThresholdBasedProactiveSDN(gym.Env):
         
     def _load_topology(self):
         """Load network topology"""
-        topology_sizes = {
-            'gridnet': 9, 'bellcanada': 48, 'os3e': 34,
-            'interoute': 110, 'cogentco': 197
-        }
-        self.num_switches = topology_sizes.get(self.topology_name, 34)
-        self.topology = nx.star_graph(self.num_switches - 1)
-        
-        np.random.seed(42)
-        self.distance_matrix = np.random.uniform(1, 20, 
-            (self.num_switches, self.total_controllers))
+        try:
+            topology_info, delay_matrix, controller_hosts = (
+                self.topology_loader.build_switch_to_controller_delay_matrix(
+                    self.topology_name,
+                    self.total_controllers,
+                )
+            )
+            self.topology_info = topology_info
+            self.topology = topology_info.graph.copy()
+            self.num_switches = self.topology.number_of_nodes()
+            self.distance_matrix = delay_matrix
+            self.controller_host_nodes = controller_hosts
+        except Exception:
+            topology_sizes = {
+                'gridnet': 9, 'bellcanada': 48, 'os3e': 34,
+                'interoute': 110, 'cogentco': 197
+            }
+            self.num_switches = topology_sizes.get(self.topology_name, 34)
+            self.topology = nx.star_graph(self.num_switches - 1)
+
+            np.random.seed(42)
+            self.distance_matrix = np.random.uniform(
+                1,
+                20,
+                (self.num_switches, self.total_controllers),
+            )
+            self.controller_host_nodes = list(range(self.total_controllers))
     
     def _initialize_mappings(self):
         """Initialize switch-controller mappings"""
@@ -101,8 +123,10 @@ class ThresholdBasedProactiveSDN(gym.Env):
         
         for switch_id in range(self.num_switches):
             active_controllers = sorted(self.active_slaves)
-            controller_idx = switch_id % len(active_controllers)
-            controller_id = active_controllers[controller_idx]
+            controller_id = min(
+                active_controllers,
+                key=lambda candidate: self.distance_matrix[switch_id, candidate]
+            )
             self.switch_to_controller[switch_id] = controller_id
     
     def _setup_spaces(self):
@@ -172,6 +196,57 @@ class ThresholdBasedProactiveSDN(gym.Env):
                 normal.append(controller_id)
         
         return {'overloaded': overloaded, 'underloaded': underloaded, 'normal': normal}
+
+    def get_valid_actions(self) -> List[int]:
+        """Return currently valid action IDs for masking or debugging."""
+        valid_actions = [0]
+        thresholds = self._check_thresholds()
+
+        if thresholds['overloaded']:
+            overloaded_set = set(thresholds['overloaded'])
+            for switch_id in range(self.num_switches):
+                source_controller = self.switch_to_controller.get(switch_id)
+                if source_controller in overloaded_set:
+                    valid_actions.append(1 + switch_id)
+
+        parked_controllers = sorted(self.parked_slaves)
+        for parked_idx, _ in enumerate(parked_controllers):
+            valid_actions.append(1 + self.num_switches + parked_idx)
+
+        if thresholds['underloaded']:
+            base_idx = 1 + self.num_switches + self.num_parked_controllers
+            valid_actions.extend(base_idx + i for i in range(self.num_slave_controllers))
+
+        return sorted(set(a for a in valid_actions if 0 <= a < self.action_space.n))
+
+    def describe_action(self, action: int) -> str:
+        """Return a human-readable label for an action ID in the current state."""
+        if action == 0:
+            return 'noop'
+
+        if 1 <= action <= self.num_switches:
+            switch_id = action - 1
+            controller_id = self.switch_to_controller.get(switch_id)
+            return f'migrate_switch_{switch_id}_from_ctrl_{controller_id}'
+
+        evoke_base = 1 + self.num_switches
+        if evoke_base <= action <= self.num_switches + self.num_parked_controllers:
+            parked_idx = action - evoke_base
+            parked_controllers = sorted(self.parked_slaves)
+            if parked_idx < len(parked_controllers):
+                return f'evoke_slot_{parked_idx}_ctrl_{parked_controllers[parked_idx]}'
+            return f'evoke_slot_{parked_idx}_unavailable'
+
+        park_base = 1 + self.num_switches + self.num_parked_controllers
+        park_idx = action - park_base
+        if 0 <= park_idx < self.num_slave_controllers:
+            underloaded = self._check_thresholds()['underloaded']
+            if underloaded:
+                target_idx = min(park_idx, len(underloaded) - 1)
+                return f'park_slot_{park_idx}_ctrl_{underloaded[target_idx]}'
+            return f'park_slot_{park_idx}_unavailable'
+
+        return f'unknown_action_{action}'
     
     def _migrate_switch(self, switch_id: int, target_controller: int) -> bool:
         """Migrate switch to target controller"""
@@ -304,8 +379,10 @@ class ThresholdBasedProactiveSDN(gym.Env):
     def _calculate_reward(self, action_type: str, success: bool) -> Tuple[float, Dict]:
         """Calculate multi-objective reward"""
         latency = self._calculate_latency()
+        worst_case_latency = self._calculate_worst_case_latency()
         energy = self._calculate_energy()
         load_variance = self._calculate_load_variance()
+        load_balance_index = self._calculate_load_balance_index()
         
         norm_latency = latency / 20.0
         norm_energy = energy / 1000.0
@@ -325,9 +402,13 @@ class ThresholdBasedProactiveSDN(gym.Env):
         
         info = {
             'latency': latency,
+            'cs_avg_latency': latency,
+            'worst_case_latency': worst_case_latency,
+            'cs_worst_latency': worst_case_latency,
             'energy': energy,
             'load_variance': load_variance,
             'load_balance': np.sqrt(load_variance),
+            'load_balance_index': load_balance_index,
             'active_controllers': len(self.active_slaves),
             'parked_controllers': len(self.parked_slaves),
             'action_type': action_type,
@@ -339,13 +420,21 @@ class ThresholdBasedProactiveSDN(gym.Env):
         return reward, info
     
     def _calculate_latency(self) -> float:
-        """Calculate average latency"""
+        """Calculate controller-switch average latency in milliseconds."""
         total = 0.0
         for switch_id, controller_id in self.switch_to_controller.items():
             distance = self.distance_matrix[switch_id, controller_id]
-            latency = distance / 2.0
-            total += latency
+            total += distance
         return total / self.num_switches
+
+    def _calculate_worst_case_latency(self) -> float:
+        """Calculate the worst controller-switch latency in milliseconds."""
+        if not self.switch_to_controller:
+            return 0.0
+        return max(
+            self.distance_matrix[switch_id, controller_id]
+            for switch_id, controller_id in self.switch_to_controller.items()
+        )
     
     def _calculate_energy(self) -> float:
         """Calculate total energy"""
@@ -360,6 +449,34 @@ class ThresholdBasedProactiveSDN(gym.Env):
             return 0.0
         loads = [self.controller_loads[c] for c in self.active_slaves]
         return np.var(loads)
+
+    def _calculate_load_balance_index(self) -> float:
+        """
+        Paper-style load-balance proxy.
+
+        Inference: use max-load / mean-load across assigned active controllers.
+        This is far more stable than max/min in this environment while still reflecting
+        how concentrated the controller burden is.
+        """
+        if not self.active_slaves:
+            return 0.0
+        assigned_loads = []
+        for controller_id in self.active_slaves:
+            num_assigned = sum(
+                1 for assigned_controller in self.switch_to_controller.values()
+                if assigned_controller == controller_id
+            )
+            if num_assigned > 0:
+                assigned_loads.append(self.controller_loads[controller_id] * num_assigned)
+
+        if len(assigned_loads) < 2:
+            return 1.0
+
+        max_load = max(assigned_loads)
+        mean_load = float(np.mean(assigned_loads))
+        if max_load <= 0:
+            return 1.0
+        return max_load / max(mean_load, 1e-3)
     
     def reset(self, seed=None, options=None):
         """Reset environment"""

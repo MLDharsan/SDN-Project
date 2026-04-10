@@ -18,6 +18,7 @@ from pathlib import Path
 import json
 from datetime import datetime
 import glob
+from collections import Counter
 
 # Import your Rainbow DQN model
 from environments.rainbow_dqn_model import RainbowDQN
@@ -86,10 +87,11 @@ class RealTrafficEnvironment(ThresholdBasedProactiveSDN):
 class ModelTester:
     """Test pre-trained Rainbow DQN models on real traffic"""
     
-    def __init__(self, model_path, traffic_path, topology_name):
+    def __init__(self, model_path, traffic_path, topology_name, mask_invalid_actions=False):
         self.model_path = Path(model_path)
         self.traffic_path = Path(traffic_path)
         self.topology_name = topology_name.strip().lower()
+        self.mask_invalid_actions = mask_invalid_actions
         
         print(f"\n{'='*70}")
         print(f"🧪 COMPLETE MODEL TESTING (WITH ACTUAL MODEL)")
@@ -97,6 +99,7 @@ class ModelTester:
         print(f"Model: {self.model_path.name}")
         print(f"Traffic: {self.traffic_path.name}")
         print(f"Topology: {topology_name.upper()}")
+        print(f"Invalid action masking: {'ON' if self.mask_invalid_actions else 'OFF'}")
         
         # Load traffic data
         self.traffic_data = np.load(traffic_path)
@@ -184,6 +187,93 @@ class ModelTester:
         print(f"   ✅ Model loaded successfully")
         
         return model
+
+    @staticmethod
+    def _apply_training_reward_logic(env):
+        """Match the context-aware reward shaping used during training."""
+        def fixed_calculate_reward(action_type: str, success: bool):
+            latency = env._calculate_latency()
+            worst_case_latency = env._calculate_worst_case_latency()
+            energy = env._calculate_energy()
+            load_variance = env._calculate_load_variance()
+            load_balance_index = env._calculate_load_balance_index()
+
+            norm_latency = latency / 20.0
+            norm_energy = energy / 1000.0
+            norm_load_var = load_variance / 1.0
+
+            reward = -1.0 * norm_latency - 2.0 * norm_energy - 1.0 * norm_load_var
+
+            thresholds = env._check_thresholds()
+            has_overload = bool(thresholds['overloaded'])
+            has_underload = bool(thresholds['underloaded'])
+            can_still_park = len(env.parked_slaves) < env.num_parked_controllers
+
+            if action_type == 'park' and success:
+                reward += 200.0 if (has_underload and can_still_park) else -20.0
+            elif action_type == 'evoke' and success:
+                reward += 200.0 if has_overload else -30.0
+            elif action_type == 'migrate' and success:
+                reward += 2.0
+
+            if action_type == 'noop':
+                if has_overload:
+                    reward -= 100.0
+                if has_underload and can_still_park:
+                    reward -= 80.0
+
+            if not success and action_type != 'noop':
+                reward -= 10.0
+
+            info = {
+                'latency': latency,
+                'cs_avg_latency': latency,
+                'worst_case_latency': worst_case_latency,
+                'cs_worst_latency': worst_case_latency,
+                'energy': energy,
+                'load_variance': load_variance,
+                'load_balance': np.sqrt(load_variance),
+                'load_balance_index': load_balance_index,
+                'active_controllers': len(env.active_slaves),
+                'parked_controllers': len(env.parked_slaves),
+                'action_type': action_type,
+                'action_success': success,
+                'overloaded_count': len(thresholds['overloaded']),
+                'underloaded_count': len(thresholds['underloaded'])
+            }
+
+            return reward, info
+
+        env._calculate_reward = fixed_calculate_reward
+
+    @staticmethod
+    def _format_action_id_counts(action_counts, env, limit=3):
+        """Format action id counters using readable action labels."""
+        items = []
+        for action_id, count in action_counts.most_common(limit):
+            items.append(f"{action_id}:{env.describe_action(action_id)}:{count}")
+        return ", ".join(items) if items else "none"
+
+    def _select_action(self, state, env):
+        """Select greedy action, optionally masking invalid choices."""
+        self.model.online_net.train(False)
+
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.model.device)
+            q_values = self.model.online_net.get_q_values(state_tensor).squeeze(0)
+            raw_action = int(q_values.argmax().item())
+
+            if not self.mask_invalid_actions:
+                return raw_action, raw_action
+
+            valid_actions = env.get_valid_actions()
+            masked_q_values = q_values.clone()
+            invalid_actions = torch.ones_like(masked_q_values, dtype=torch.bool)
+            invalid_actions[valid_actions] = False
+            masked_q_values[invalid_actions] = -torch.inf
+            chosen_action = int(masked_q_values.argmax().item())
+
+        return raw_action, chosen_action
     
     def test(self, num_episodes=10, steps_per_episode=500):
         """
@@ -203,6 +293,7 @@ class ModelTester:
             num_slave_controllers=3,
             num_parked_controllers=2
         )
+        self._apply_training_reward_logic(env)
 
         env_state_dim = env.observation_space.shape[0]
         env_action_dim = env.action_space.n
@@ -218,8 +309,24 @@ class ModelTester:
         parking_events = []
         evoking_events = []
         latencies = []
+        worst_case_latencies = []
         energies = []
         load_variances = []
+        load_balance_indices = []
+        action_type_counts = Counter()
+        successful_action_counts = Counter()
+        failed_action_counts = Counter()
+        raw_action_counts = Counter()
+        executed_action_counts = Counter()
+        masked_action_override_count = 0
+        overload_observations = 0
+        underload_observations = 0
+        overload_with_parked_capacity = 0
+        underload_with_parking_capacity = 0
+        successful_evokes_on_overload = 0
+        successful_parks_on_underload = 0
+        action_legends = {}
+        oscillation_events = 0
         
         for ep in range(num_episodes):
             state, _ = env.reset()
@@ -229,12 +336,30 @@ class ModelTester:
             ep_latencies = []
             ep_energies = []
             ep_load_vars = []
+            ep_worst_latencies = []
+            ep_load_balance_indices = []
+            ep_action_counts = Counter()
+            ep_failed_action_counts = Counter()
+            ep_raw_action_counts = Counter()
+            ep_executed_action_counts = Counter()
+            ep_masked_overrides = 0
+            ep_oscillations = 0
+            last_successful_proactive_action = None
             
             print(f"Episode {ep+1}/{num_episodes}: ", end='', flush=True)
             
             for step in range(steps_per_episode):
                 # 🔥 USE TRAINED MODEL (not random!)
-                action = self.model.select_action(state, training=False)
+                raw_action, action = self._select_action(state, env)
+                action_legends[str(raw_action)] = env.describe_action(raw_action)
+                action_legends[str(action)] = env.describe_action(action)
+                raw_action_counts[raw_action] += 1
+                executed_action_counts[action] += 1
+                ep_raw_action_counts[raw_action] += 1
+                ep_executed_action_counts[action] += 1
+                if raw_action != action:
+                    masked_action_override_count += 1
+                    ep_masked_overrides += 1
                 
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
@@ -243,13 +368,44 @@ class ModelTester:
                 ep_latencies.append(info.get('latency', 0))
                 ep_energies.append(info.get('energy', 0))
                 ep_load_vars.append(info.get('load_variance', 0))
+                ep_worst_latencies.append(info.get('worst_case_latency', 0))
+                ep_load_balance_indices.append(info.get('load_balance_index', 0))
                 
                 # Track events
                 action_type = info.get('action_type', '')
+                action_success = info.get('action_success', False)
+                action_type_counts[action_type] += 1
+                ep_action_counts[action_type] += 1
+                if action_success:
+                    successful_action_counts[action_type] += 1
+                else:
+                    failed_action_counts[action_type] += 1
+                    ep_failed_action_counts[action_type] += 1
+                has_overload = info.get('overloaded_count', 0) > 0
+                has_underload = info.get('underloaded_count', 0) > 0
+                has_parked_to_evoke = info.get('parked_controllers', 0) > 0
+                has_room_to_park = info.get('parked_controllers', 0) < env.num_parked_controllers
+                overload_observations += int(has_overload)
+                underload_observations += int(has_underload)
+                overload_with_parked_capacity += int(has_overload and has_parked_to_evoke)
+                underload_with_parking_capacity += int(has_underload and has_room_to_park)
+
                 if 'park' in action_type and info.get('action_success'):
                     ep_parking += 1
+                    if has_underload:
+                        successful_parks_on_underload += 1
                 elif 'evoke' in action_type and info.get('action_success'):
                     ep_evoking += 1
+                    if has_overload:
+                        successful_evokes_on_overload += 1
+
+                if action_success and action_type in {'park', 'evoke'}:
+                    if last_successful_proactive_action and last_successful_proactive_action != action_type:
+                        oscillation_events += 1
+                        ep_oscillations += 1
+                    last_successful_proactive_action = action_type
+                elif action_success and action_type == 'noop':
+                    last_successful_proactive_action = None
                 
                 state = next_state
                 
@@ -260,16 +416,32 @@ class ModelTester:
             parking_events.append(ep_parking)
             evoking_events.append(ep_evoking)
             latencies.append(np.mean(ep_latencies) if ep_latencies else 0)
+            worst_case_latencies.append(np.max(ep_worst_latencies) if ep_worst_latencies else 0)
             energies.append(np.mean(ep_energies) if ep_energies else 0)
             load_variances.append(np.mean(ep_load_vars) if ep_load_vars else 0)
-            
-            print(f"✅ R={episode_reward:.1f} | P={ep_parking} | E={ep_evoking}")
+            load_balance_indices.append(np.mean(ep_load_balance_indices) if ep_load_balance_indices else 0)
+
+            top_actions = ", ".join(
+                f"{name}:{count}" for name, count in ep_action_counts.most_common(3)
+            ) or "none"
+            top_failures = ", ".join(
+                f"{name}:{count}" for name, count in ep_failed_action_counts.most_common(2)
+            ) or "none"
+            top_raw_ids = self._format_action_id_counts(ep_raw_action_counts, env)
+            top_exec_ids = self._format_action_id_counts(ep_executed_action_counts, env)
+            print(
+                f"✅ R={episode_reward:.1f} | P={ep_parking} | E={ep_evoking} | "
+                f"Actions[{top_actions}] | Fail[{top_failures}] | "
+                f"RawIDs[{top_raw_ids}] | ExecIDs[{top_exec_ids}] | "
+                f"Masked={ep_masked_overrides} | Osc={ep_oscillations}"
+            )
         
         env.close()
         
         # Calculate results
         total_parking = int(np.sum(parking_events))
         total_evoking = int(np.sum(evoking_events))
+        total_steps = sum(action_type_counts.values())
         
         results = {
             'model': str(self.model_path.name),
@@ -278,14 +450,19 @@ class ModelTester:
             'test_date': datetime.now().isoformat(),
             'num_episodes': num_episodes,
             'model_used': 'Rainbow DQN (trained)',  # ✅ Not random!
+            'reward_logic': 'CONTEXT-AWARE training reward matched during evaluation',
+            'mask_invalid_actions': bool(self.mask_invalid_actions),
             
             # Performance metrics
             'avg_reward': float(np.mean(episode_rewards)),
             'std_reward': float(np.std(episode_rewards)),
             'avg_latency': float(np.mean(latencies)),
+            'cs_avg_latency': float(np.mean(latencies)),
+            'cs_worst_latency': float(np.mean(worst_case_latencies)),
             'std_latency': float(np.std(latencies)),
             'avg_energy': float(np.mean(energies)),
             'avg_load_variance': float(np.mean(load_variances)),
+            'load_balance_index': float(np.mean(load_balance_indices)),
             
             # Proactive behavior
             'total_parking': total_parking,
@@ -293,6 +470,31 @@ class ModelTester:
             'avg_parking_per_ep': float(np.mean(parking_events)),
             'avg_evoking_per_ep': float(np.mean(evoking_events)),
             'pe_ratio': float(total_parking / total_evoking) if total_evoking > 0 else None,
+            'total_steps': int(total_steps),
+            'action_type_counts': dict(action_type_counts),
+            'successful_action_counts': dict(successful_action_counts),
+            'failed_action_counts': dict(failed_action_counts),
+            'raw_action_id_counts': {str(k): int(v) for k, v in raw_action_counts.items()},
+            'executed_action_id_counts': {str(k): int(v) for k, v in executed_action_counts.items()},
+            'action_id_legend': action_legends,
+            'masked_action_override_count': int(masked_action_override_count),
+            'masked_action_override_fraction': float(masked_action_override_count / total_steps) if total_steps else 0.0,
+            'overload_step_fraction': float(overload_observations / total_steps) if total_steps else 0.0,
+            'underload_step_fraction': float(underload_observations / total_steps) if total_steps else 0.0,
+            'overload_with_parked_capacity_fraction': float(overload_with_parked_capacity / total_steps) if total_steps else 0.0,
+            'underload_with_parking_capacity_fraction': float(underload_with_parking_capacity / total_steps) if total_steps else 0.0,
+            'successful_evokes_on_overload': int(successful_evokes_on_overload),
+            'successful_parks_on_underload': int(successful_parks_on_underload),
+            'evoke_response_rate_when_needed': (
+                float(successful_evokes_on_overload / overload_with_parked_capacity)
+                if overload_with_parked_capacity > 0 else None
+            ),
+            'park_response_rate_when_needed': (
+                float(successful_parks_on_underload / underload_with_parking_capacity)
+                if underload_with_parking_capacity > 0 else None
+            ),
+            'oscillation_events': int(oscillation_events),
+            'oscillation_fraction': float(oscillation_events / total_steps) if total_steps else 0.0,
             
             # Raw data
             'episode_rewards': [float(r) for r in episode_rewards],
@@ -309,11 +511,15 @@ class ModelTester:
         print(f"{'='*70}\n")
         
         print(f"Model: {results['model_used']} ✅")
+        print(f"Reward logic: {results['reward_logic']}")
+        print(f"Invalid action masking: {'ON' if results['mask_invalid_actions'] else 'OFF'}")
         print(f"\nPerformance:")
         print(f"  Avg Reward: {results['avg_reward']:.2f} (±{results['std_reward']:.2f})")
         print(f"  Avg Latency: {results['avg_latency']:.2f} ms")
+        print(f"  Worst-case Latency: {results['cs_worst_latency']:.2f} ms")
         print(f"  Avg Energy: {results['avg_energy']:.2f} W")
         print(f"  Load Variance: {results['avg_load_variance']:.4f}")
+        print(f"  Load Balance Index: {results['load_balance_index']:.4f}")
         
         print(f"\nProactive Behavior:")
         print(f"  Total Parking: {results['total_parking']}")
@@ -322,6 +528,41 @@ class ModelTester:
         print(f"  Avg Evoke/Episode: {results['avg_evoking_per_ep']:.1f}")
         pe_ratio = results['pe_ratio']
         print(f"  P/E Ratio: {pe_ratio:.2f}" if pe_ratio is not None else "  P/E Ratio: N/A (no evoke events)")
+        print(f"  Overload steps: {results['overload_step_fraction']*100:.1f}%")
+        print(f"  Underload steps: {results['underload_step_fraction']*100:.1f}%")
+        evoke_rr = results['evoke_response_rate_when_needed']
+        park_rr = results['park_response_rate_when_needed']
+        print(
+            f"  Evoke response (when needed): {evoke_rr*100:.1f}%"
+            if evoke_rr is not None else
+            "  Evoke response (when needed): N/A (no overload+parked-capacity demand)"
+        )
+        print(
+            f"  Park response (when needed): {park_rr*100:.1f}%"
+            if park_rr is not None else
+            "  Park response (when needed): N/A (no underload+parking-capacity demand)"
+        )
+
+        print(f"\nDebug:")
+        print(f"  Action counts: {results['action_type_counts']}")
+        print(f"  Successful actions: {results['successful_action_counts']}")
+        print(f"  Failed actions: {results['failed_action_counts']}")
+        print(f"  Raw action IDs: {results['raw_action_id_counts']}")
+        print(f"  Executed action IDs: {results['executed_action_id_counts']}")
+        print(
+            f"  Mask overrides: {results['masked_action_override_count']} "
+            f"({results['masked_action_override_fraction']*100:.1f}%)"
+        )
+        print(
+            f"  Park/Evoke oscillations: {results['oscillation_events']} "
+            f"({results['oscillation_fraction']*100:.1f}%)"
+        )
+        if results['action_id_legend']:
+            legend_preview = ", ".join(
+                f"{action_id}={label}"
+                for action_id, label in sorted(results['action_id_legend'].items(), key=lambda item: int(item[0]))[:8]
+            )
+            print(f"  Action legend: {legend_preview}")
         
         # Evaluation
         if results['total_parking'] > 50:
@@ -347,7 +588,7 @@ class ModelTester:
         return output_path
 
 
-def test_all_models():
+def test_all_models(mask_invalid_actions=False):
     """Test all 5 topology models WITH ACTUAL MODEL LOADING"""
     
     print(f"\n{'='*70}")
@@ -364,11 +605,11 @@ def test_all_models():
         print(f"{'─'*70}")
         
         # Find model (use LATEST version)
-        model_pattern = f'../models/LATEST_rainbow_proactive_{topo}.pth'
+        model_pattern = f'../../models/LATEST_rainbow_proactive_{topo}.pth'
         model_files = glob.glob(model_pattern)
         
         if not model_files:
-            model_pattern = f'../models/rainbow_proactive_{topo}_*.pth'
+            model_pattern = f'../../models/rainbow_proactive_{topo}_*.pth'
             model_files = glob.glob(model_pattern)
         
         if not model_files:
@@ -384,7 +625,12 @@ def test_all_models():
         
         try:
             # Test with REAL MODEL
-            tester = ModelTester(model_path, traffic_path, topo)
+            tester = ModelTester(
+                model_path,
+                traffic_path,
+                topo,
+                mask_invalid_actions=mask_invalid_actions
+            )
             results = tester.test(num_episodes=10, steps_per_episode=500)
             tester.print_results(results)
             output_path = tester.save_results(results)
@@ -425,13 +671,23 @@ if __name__ == '__main__':
     parser.add_argument('--topology', help='Topology name')
     parser.add_argument('--test-all', action='store_true', 
                        help='Test all 5 models')
+    parser.add_argument(
+        '--mask-invalid-actions',
+        action='store_true',
+        help='Mask impossible actions during evaluation and choose the best valid action instead'
+    )
     
     args = parser.parse_args()
     
     if args.test_all:
-        test_all_models()
+        test_all_models(mask_invalid_actions=args.mask_invalid_actions)
     elif args.model and args.traffic and args.topology:
-        tester = ModelTester(args.model, args.traffic, args.topology)
+        tester = ModelTester(
+            args.model,
+            args.traffic,
+            args.topology,
+            mask_invalid_actions=args.mask_invalid_actions
+        )
         results = tester.test()
         tester.print_results(results)
         tester.save_results(results)

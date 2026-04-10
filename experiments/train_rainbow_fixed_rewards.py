@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Rainbow DQN Training - AGGRESSIVE PROACTIVE REWARDS
+Rainbow DQN Training - CONTEXT-AWARE PROACTIVE REWARDS
 
 FIXES:
-- Aggressive reward bonuses (Park=+200, Evoke=+150)
-- Strong penalties for inaction (-100/-80)
+- Context-aware proactive bonuses (Park/Evoke only when needed)
+- Strong penalties for inaction when corrective action is needed
 - All JSON serialization issues fixed
 - get_topology_size() function included
 """
@@ -13,6 +13,7 @@ import sys
 import os
 import torch
 import numpy as np
+import time
 from datetime import datetime
 from collections import deque
 
@@ -28,25 +29,26 @@ def train_rainbow_fixed_rewards(
     mode='proactive',
     train_freq=4,
     convergence_window=3,
-    eval_freq=2000
+    eval_freq=2000,
+    mask_invalid_actions=False
 ):
-    """
-    Train Rainbow DQN with AGGRESSIVE PROACTIVE rewards
-    """
+    """Train Rainbow DQN with context-aware proactive rewards."""
     
     topology = topology.strip().lower()
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    training_start_time = time.time()
 
     print(f"\n{'='*70}")
-    print(f"🚀 RAINBOW DQN TRAINING - AGGRESSIVE PROACTIVE REWARDS")
+    print(f"🚀 RAINBOW DQN TRAINING - CONTEXT-AWARE PROACTIVE REWARDS")
     print(f"{'='*70}\n")
     
     print(f"Configuration:")
     print(f"  Topology: {topology} ({get_topology_size(topology)} nodes)")
     print(f"  Timesteps: {timesteps:,}")
     print(f"  Mode: {mode}")
-    print(f"  ⚡ AGGRESSIVE: Proactive bonuses (Park=+200, Evoke=+150)")
-    print(f"  ⚡ PENALTIES: NoAction when needed (-100/-80)")
+    print(f"  Mask invalid actions: {'ON' if mask_invalid_actions else 'OFF'}")
+    print(f"  ⚡ CONTEXT-AWARE: Park/Evoke bonuses only when needed")
+    print(f"  ⚡ PENALTIES: NoAction when corrective action is needed")
     print()
     
     # Import
@@ -65,18 +67,18 @@ def train_rainbow_fixed_rewards(
     )
     
     # ========================================================================
-    # 🔥 AGGRESSIVE REWARD FUNCTION
+    # CONTEXT-AWARE REWARD FUNCTION
     # ========================================================================
     original_calculate_reward = env._calculate_reward
     
     def fixed_calculate_reward(action_type: str, success: bool):
-        """
-        AGGRESSIVE reward function to encourage proactive behavior
-        """
+        """Context-aware reward to avoid unnecessary park/evoke actions."""
         # Calculate base metrics
         latency = env._calculate_latency()
+        worst_case_latency = env._calculate_worst_case_latency()
         energy = env._calculate_energy()
         load_variance = env._calculate_load_variance()
+        load_balance_index = env._calculate_load_balance_index()
         
         # Base reward (lighter scale)
         norm_latency = latency / 20.0
@@ -85,24 +87,27 @@ def train_rainbow_fixed_rewards(
         
         reward = -1.0 * norm_latency - 2.0 * norm_energy - 1.0 * norm_load_var
         
-        # 🔥 AGGRESSIVE BONUSES for proactive actions
-        if action_type == 'park' and success:
-            reward += 200.0   # BIG bonus to encourage parking
-        elif action_type == 'evoke' and success:
-            reward += 150.0   # BIG bonus to encourage evoking
-        elif action_type == 'migrate' and success:
-            reward += 2.0     # Small bonus
-        
-        # 🔥 STRONG PENALTIES for inaction when should act
         thresholds = env._check_thresholds()
+        has_overload = bool(thresholds['overloaded'])
+        has_underload = bool(thresholds['underloaded'])
+        can_still_park = len(env.parked_slaves) < env.num_parked_controllers
+
+        if action_type == 'park' and success:
+            # Reward parking only when there is true underload and spare parking capacity.
+            reward += 200.0 if (has_underload and can_still_park) else -20.0
+        elif action_type == 'evoke' and success:
+            # Reward evoke only as overload relief; discourage needless waking.
+            reward += 200.0 if has_overload else -30.0
+        elif action_type == 'migrate' and success:
+            reward += 2.0
         
         if action_type == 'noop':
             # Heavy penalty for ignoring overload
-            if thresholds['overloaded']:
+            if has_overload:
                 reward -= 100.0
             
-            # Heavy penalty for not parking when possible
-            if thresholds['underloaded'] and len(env.parked_slaves) < env.num_parked_controllers:
+            # Penalty for not parking when there is underload and parking capacity.
+            if has_underload and can_still_park:
                 reward -= 80.0
         
         # Failure penalty
@@ -112,9 +117,13 @@ def train_rainbow_fixed_rewards(
         # Info dict
         info = {
             'latency': latency,
+            'cs_avg_latency': latency,
+            'worst_case_latency': worst_case_latency,
+            'cs_worst_latency': worst_case_latency,
             'energy': energy,
             'load_variance': load_variance,
             'load_balance': np.sqrt(load_variance),
+            'load_balance_index': load_balance_index,
             'active_controllers': len(env.active_slaves),
             'parked_controllers': len(env.parked_slaves),
             'action_type': action_type,
@@ -195,17 +204,34 @@ def train_rainbow_fixed_rewards(
     def get_epsilon(step):
         return epsilon_end + (epsilon_start - epsilon_end) * \
                np.exp(-1.0 * step / epsilon_decay)
+
+    def select_masked_action(current_state):
+        """Choose the best valid action from the current Q-values."""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(agent.device)
+            q_values = agent.online_net.get_q_values(state_tensor).squeeze(0)
+            raw_action = int(q_values.argmax().item())
+            valid_actions = env.get_valid_actions()
+            masked_q_values = q_values.clone()
+            invalid_actions = torch.ones_like(masked_q_values, dtype=torch.bool)
+            invalid_actions[valid_actions] = False
+            masked_q_values[invalid_actions] = -torch.inf
+            chosen_action = int(masked_q_values.argmax().item())
+            return raw_action, chosen_action, valid_actions
     
     # Tracking
     episode_rewards = []
     episode_latencies = []
+    episode_worst_latencies = []
     episode_energies = []
     episode_load_variances = []
+    episode_load_balance_indices = []
     eval_rewards = deque(maxlen=convergence_window)
     parking_events = 0
     evoking_events = 0
     migrate_events = 0
     no_action_count = 0
+    invalid_action_overrides = 0
     losses = []
     recent_actions = deque(maxlen=200)
     
@@ -214,14 +240,17 @@ def train_rainbow_fixed_rewards(
     episode_reward = 0
     episode_count = 0
     current_episode_latencies = []
+    current_episode_worst_latencies = []
     current_episode_energies = []
     current_episode_load_variances = []
+    current_episode_load_balance_indices = []
     
     print(f"Starting training on {device}...\n")
     print("Progress: [", end='', flush=True)
+    progress_interval = max(1, timesteps // 50)
     
     for step in range(timesteps):
-        if step % (timesteps // 50) == 0:
+        if step % progress_interval == 0:
             print('=', end='', flush=True)
         
         # Traffic variation
@@ -234,9 +263,18 @@ def train_rainbow_fixed_rewards(
         epsilon = get_epsilon(step)
         
         if np.random.random() < epsilon:
-            action = np.random.randint(action_dim)
+            if mask_invalid_actions:
+                valid_actions = env.get_valid_actions()
+                action = int(np.random.choice(valid_actions))
+            else:
+                action = np.random.randint(action_dim)
         else:
-            action = agent.select_action(state, training=True)
+            if mask_invalid_actions:
+                raw_action, action, _ = select_masked_action(state)
+                if raw_action != action:
+                    invalid_action_overrides += 1
+            else:
+                action = agent.select_action(state, training=True)
         
         # Step
         next_state, reward, terminated, truncated, info = env.step(action)
@@ -261,13 +299,19 @@ def train_rainbow_fixed_rewards(
             tensorboard_writer.add_scalar(
                 "train/parked_controllers", float(info.get('parked_controllers', 0.0)), step
             )
+            if mask_invalid_actions:
+                tensorboard_writer.add_scalar(
+                    "train/invalid_action_overrides", float(invalid_action_overrides), step
+                )
         
         # Track events
         action_type = info.get('action_type', '')
         recent_actions.append(action_type)
         current_episode_latencies.append(float(info.get('latency', 0.0)))
+        current_episode_worst_latencies.append(float(info.get('worst_case_latency', 0.0)))
         current_episode_energies.append(float(info.get('energy', 0.0)))
         current_episode_load_variances.append(float(info.get('load_variance', 0.0)))
+        current_episode_load_balance_indices.append(float(info.get('load_balance_index', 0.0)))
         
         if 'park' in action_type and info.get('action_success'):
             parking_events += 1
@@ -311,10 +355,21 @@ def train_rainbow_fixed_rewards(
                 float(np.mean(current_episode_load_variances))
                 if current_episode_load_variances else 0.0
             )
+            episode_worst_latencies.append(
+                float(np.max(current_episode_worst_latencies))
+                if current_episode_worst_latencies else 0.0
+            )
+            episode_load_balance_indices.append(
+                float(np.mean(current_episode_load_balance_indices))
+                if current_episode_load_balance_indices else 0.0
+            )
             if tensorboard_writer is not None:
                 tensorboard_writer.add_scalar("episode/reward", float(episode_reward), episode_count)
                 tensorboard_writer.add_scalar(
                     "episode/avg_latency", episode_latencies[-1], episode_count
+                )
+                tensorboard_writer.add_scalar(
+                    "episode/worst_latency", episode_worst_latencies[-1], episode_count
                 )
                 tensorboard_writer.add_scalar(
                     "episode/avg_energy", episode_energies[-1], episode_count
@@ -322,12 +377,17 @@ def train_rainbow_fixed_rewards(
                 tensorboard_writer.add_scalar(
                     "episode/avg_load_variance", episode_load_variances[-1], episode_count
                 )
+                tensorboard_writer.add_scalar(
+                    "episode/load_balance_index", episode_load_balance_indices[-1], episode_count
+                )
             episode_count += 1
             state, _ = env.reset()
             episode_reward = 0
             current_episode_latencies = []
+            current_episode_worst_latencies = []
             current_episode_energies = []
             current_episode_load_variances = []
+            current_episode_load_balance_indices = []
         
         # Evaluation
         if step % eval_freq == 0 and step > 0:
@@ -351,6 +411,8 @@ def train_rainbow_fixed_rewards(
                     f"Avg Load Var: {recent_avg_load_var:.4f}"
                 )
             print(f"Actions - Park: {parking_events} | Evoke: {evoking_events} | Migrate: {migrate_events} | NoAction: {no_action_count}")
+            if mask_invalid_actions:
+                print(f"Masked invalid greedy choices: {invalid_action_overrides}")
             if tensorboard_writer is not None:
                 tensorboard_writer.add_scalar("eval/avg_reward_last100", float(avg_reward), step)
                 tensorboard_writer.add_scalar("eval/avg_latency_last100", recent_avg_latency, step)
@@ -363,6 +425,10 @@ def train_rainbow_fixed_rewards(
                 tensorboard_writer.add_scalar("actions/evoking_events", float(evoking_events), step)
                 tensorboard_writer.add_scalar("actions/migrate_events", float(migrate_events), step)
                 tensorboard_writer.add_scalar("actions/no_action_count", float(no_action_count), step)
+                if mask_invalid_actions:
+                    tensorboard_writer.add_scalar(
+                        "actions/invalid_action_overrides", float(invalid_action_overrides), step
+                    )
             
             if len(losses) > 0:
                 print(f"Avg Loss: {np.mean(losses[-1000:]):.4f}")
@@ -406,6 +472,8 @@ def train_rainbow_fixed_rewards(
                       else float(np.mean(episode_rewards)) if len(episode_rewards) > 0 \
                       else 0.0
     final_avg_latency = float(np.mean(episode_latencies)) if episode_latencies else 0.0
+    final_avg_cs_latency = final_avg_latency
+    final_worst_latency = float(np.mean(episode_worst_latencies)) if episode_worst_latencies else 0.0
     final_std_latency = float(np.std(episode_latencies)) if episode_latencies else 0.0
     final_avg_energy = float(np.mean(episode_energies)) if episode_energies else 0.0
     final_std_energy = float(np.std(episode_energies)) if episode_energies else 0.0
@@ -415,6 +483,10 @@ def train_rainbow_fixed_rewards(
     final_std_load_variance = (
         float(np.std(episode_load_variances)) if episode_load_variances else 0.0
     )
+    training_time_seconds = float(time.time() - training_start_time)
+    final_avg_load_balance_index = (
+        float(np.mean(episode_load_balance_indices)) if episode_load_balance_indices else 0.0
+    )
     
     metadata = {
         'topology': str(topology),
@@ -422,7 +494,11 @@ def train_rainbow_fixed_rewards(
         'timesteps': int(timesteps),
         'mode': str(mode),
         'timestamp': datetime.now().isoformat(),
-        'reward_function': 'AGGRESSIVE (Park=+200, Evoke=+150, NoAction=-100)',
+        'reward_function': (
+            'CONTEXT_AWARE (Park=+200 if needed else -20, '
+            'Evoke=+200 if overloaded else -30, NoAction penalties on unmet overload/underload)'
+        ),
+        'mask_invalid_actions': bool(mask_invalid_actions),
         
         # Reward metrics (ALL converted to float)
         'final_avg_reward_last100': float(final_avg_reward),
@@ -431,23 +507,28 @@ def train_rainbow_fixed_rewards(
         'best_episode_reward': float(np.max(episode_rewards)) if episode_rewards else 0.0,
         'worst_episode_reward': float(np.min(episode_rewards)) if episode_rewards else 0.0,
         'avg_latency': final_avg_latency,
+        'cs_avg_latency': final_avg_cs_latency,
+        'cs_worst_latency': final_worst_latency,
         'std_latency': final_std_latency,
         'avg_energy': final_avg_energy,
         'std_energy': final_std_energy,
         'avg_load_variance': final_avg_load_variance,
         'std_load_variance': final_std_load_variance,
+        'load_balance_index': final_avg_load_balance_index,
         
         # Events (ALL converted to int)
         'parking_events': int(parking_events),
         'evoking_events': int(evoking_events),
         'migrate_events': int(migrate_events),
         'no_action_count': int(no_action_count),
+        'invalid_action_overrides': int(invalid_action_overrides),
         'pe_ratio': float(parking_events / evoking_events) if evoking_events > 0 else None,
         
         # Training stats
         'total_episodes': int(episode_count),
         'avg_loss': float(np.mean(losses)) if losses else 0.0,
         'final_epsilon': float(get_epsilon(timesteps)),
+        'training_time_seconds': training_time_seconds,
         
         # Model architecture
         'state_dim': int(state_dim),
@@ -486,6 +567,8 @@ def train_rainbow_fixed_rewards(
     print(f"\n🎬 Action Summary:")
     print(f"  Parking: {parking_events} | Evoking: {evoking_events}")
     print(f"  Migrate: {migrate_events} | NoAction: {no_action_count}")
+    if mask_invalid_actions:
+        print(f"  Invalid greedy overrides: {invalid_action_overrides}")
     if evoking_events > 0:
         print(f"  P/E Ratio: {parking_events / evoking_events:.2f}")
     print(f"{'='*70}\n")
@@ -509,6 +592,7 @@ def train_rainbow_fixed_rewards(
                 'batch_size': batch_size,
                 'buffer_size': buffer_size,
                 'timesteps': timesteps,
+                'mask_invalid_actions': int(mask_invalid_actions),
             },
             {
                 'hparam/final_avg_reward': final_avg_reward,
@@ -517,6 +601,7 @@ def train_rainbow_fixed_rewards(
                 'hparam/avg_load_variance': final_avg_load_variance,
                 'hparam/parking_events': float(parking_events),
                 'hparam/evoking_events': float(evoking_events),
+                'hparam/invalid_action_overrides': float(invalid_action_overrides),
             }
         )
         tensorboard_writer.close()
@@ -547,6 +632,11 @@ if __name__ == "__main__":
     parser.add_argument('--mode', default='proactive',
                        choices=['proactive', 'reactive'])
     parser.add_argument('--train-freq', type=int, default=4)
+    parser.add_argument(
+        '--mask-invalid-actions',
+        action='store_true',
+        help='During training, sample only valid actions and mask invalid greedy choices'
+    )
     
     args = parser.parse_args()
     
@@ -554,10 +644,11 @@ if __name__ == "__main__":
         topology=args.topology,
         timesteps=args.timesteps,
         mode=args.mode,
-        train_freq=args.train_freq
+        train_freq=args.train_freq,
+        mask_invalid_actions=args.mask_invalid_actions
     )
     
-    print(f"\n✅ Training complete with AGGRESSIVE proactive rewards!")
+    print(f"\n✅ Training complete with CONTEXT-AWARE proactive rewards!")
     print(f"\nTo train all topologies, run:")
     print(f"  for topo in gridnet bellcanada os3e interoute cogentco; do")
     print(f"    python train_rainbow_fixed.py --topology $topo --timesteps 20000")
