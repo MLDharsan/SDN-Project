@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from environments.rainbow_dqn_model import RainbowDQN
 from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 PAPER_RESULTS = {
     'gridnet': {'cs_avg_latency': 3.34, 'cs_worst_latency': 8.71, 'load_balance_index': 2.68},
@@ -36,92 +37,17 @@ PAPER_RESULTS_STATUS = "UNVERIFIED_MANUAL_ENTRY"
 
 
 class RealTrafficEvaluationEnvironment(ThresholdBasedProactiveSDN):
-    """Use processed traffic traces instead of synthetic day/night sampling."""
+    """Backward-compatible name for the trace-aware core environment."""
 
     def __init__(self, traffic_data, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.real_traffic_data = traffic_data
-        self.traffic_index = 0
-        self.max_traffic_steps = len(traffic_data)
-
-    def _simulate_traffic_variation(self):
-        if self.traffic_index >= self.max_traffic_steps:
-            self.traffic_index = 0
-
-        current_traffic = self.real_traffic_data[self.traffic_index]
-        self.traffic_index += 1
-        self.controller_loads = {i: 0.0 for i in range(self.total_controllers)}
-
-        for switch_id in range(self.num_switches):
-            controller_id = self.switch_to_controller[switch_id]
-            if controller_id in self.parked_slaves:
-                continue
-
-            if switch_id < len(current_traffic):
-                switch_load = current_traffic[switch_id]
-            else:
-                switch_load = current_traffic[switch_id % len(current_traffic)]
-
-            self.controller_loads[controller_id] += switch_load
-
-        for controller_id in self.active_slaves:
-            num_assigned = sum(
-                1 for switch, assigned_controller in self.switch_to_controller.items()
-                if assigned_controller == controller_id
-            )
-            if num_assigned > 0:
-                self.controller_loads[controller_id] /= num_assigned
-                self.controller_loads[controller_id] = np.clip(self.controller_loads[controller_id], 0, 1)
+        super().__init__(*args, traffic_data=traffic_data, traffic_update_interval=1, **kwargs)
 
 
 def apply_training_reward_logic(env):
-    """Match the aggressive reward shaping used in training."""
-    def fixed_calculate_reward(action_type: str, success: bool):
-        latency = env._calculate_latency()
-        worst_case_latency = env._calculate_worst_case_latency()
-        energy = env._calculate_energy()
-        load_variance = env._calculate_load_variance()
-        load_balance_index = env._calculate_load_balance_index()
-
-        norm_latency = latency / 20.0
-        norm_energy = energy / 1000.0
-        norm_load_var = load_variance / 1.0
-        reward = -1.0 * norm_latency - 2.0 * norm_energy - 1.0 * norm_load_var
-
-        if action_type == 'park' and success:
-            reward += 200.0
-        elif action_type == 'evoke' and success:
-            reward += 150.0
-        elif action_type == 'migrate' and success:
-            reward += 2.0
-
-        thresholds = env._check_thresholds()
-        if action_type == 'noop':
-            if thresholds['overloaded']:
-                reward -= 100.0
-            if thresholds['underloaded'] and len(env.parked_slaves) < env.num_parked_controllers:
-                reward -= 80.0
-
-        if not success and action_type != 'noop':
-            reward -= 10.0
-
-        return reward, {
-            'latency': latency,
-            'cs_avg_latency': latency,
-            'worst_case_latency': worst_case_latency,
-            'cs_worst_latency': worst_case_latency,
-            'energy': energy,
-            'load_variance': load_variance,
-            'load_balance_index': load_balance_index,
-            'active_controllers': len(env.active_slaves),
-            'parked_controllers': len(env.parked_slaves),
-            'action_type': action_type,
-            'action_success': success,
-            'overloaded_count': len(thresholds['overloaded']),
-            'underloaded_count': len(thresholds['underloaded']),
-        }
-
-    env._calculate_reward = fixed_calculate_reward
+    """Compatibility hook; reward logic now lives in the core environment."""
+    env.last_successful_proactive_action = None
+    env.last_successful_proactive_step = -10_000
+    return env
 
 
 def load_rainbow_model(model_path: str):
@@ -132,8 +58,8 @@ def load_rainbow_model(model_path: str):
         action_dim = checkpoint.get('action_dim')
         hidden_dim = None
 
-        if 'hyperparameters' in checkpoint:
-            hidden_dim = checkpoint['hyperparameters'].get('hidden_dim')
+        hyperparameters = checkpoint.get('hyperparameters', {})
+        hidden_dim = hyperparameters.get('hidden_dim')
 
         if hidden_dim is None and 'online_net' in checkpoint and 'feature.0.weight' in checkpoint['online_net']:
             hidden_dim = checkpoint['online_net']['feature.0.weight'].shape[0]
@@ -154,13 +80,19 @@ def load_rainbow_model(model_path: str):
     if hidden_dim is None:
         hidden_dim = 256
 
+    hp = checkpoint.get('hyperparameters', {})
     model = RainbowDQN(
         state_dim=state_dim,
         action_dim=action_dim,
         hidden_dim=hidden_dim,
-        lr=1e-4,
-        gamma=0.99,
-        n_step=3,
+        lr=hp.get('lr', hp.get('learning_rate', 1e-4)),
+        gamma=hp.get('gamma', 0.99),
+        n_step=hp.get('n_step', 3),
+        buffer_size=hp.get('buffer_size', 100_000),
+        batch_size=hp.get('batch_size', 128),
+        n_atoms=hp.get('n_atoms', 51),
+        v_min=hp.get('v_min', -10),
+        v_max=hp.get('v_max', 10),
         device='cpu',
     )
     model.online_net.load_state_dict(checkpoint['online_net'])
@@ -194,13 +126,15 @@ def evaluate_model(
     steps_per_episode: int = 500,
     mask_invalid_actions: bool = False,
     traffic_path: str | None = None,
+    seed: int = 1042,
 ):
     model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     model, checkpoint = load_rainbow_model(str(model_path))
-    metadata_path = model_path.with_name(model_path.stem.replace('LATEST_', '') + '_metadata.json')
+    resolved_model_path = model_path.resolve()
+    metadata_path = resolved_model_path.with_name(resolved_model_path.stem + '_metadata.json')
     metadata = None
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text())
@@ -208,8 +142,9 @@ def evaluate_model(
     traffic_data = None
     if traffic_path:
         traffic_path = Path(traffic_path)
-        if traffic_path.exists():
-            traffic_data = np.load(traffic_path)
+        if not traffic_path.exists():
+            raise FileNotFoundError(f"Traffic trace not found: {traffic_path}")
+        traffic_data = np.load(traffic_path)
 
     if traffic_data is not None:
         env = RealTrafficEvaluationEnvironment(
@@ -217,15 +152,22 @@ def evaluate_model(
             topology_name=topology,
             num_slave_controllers=3,
             num_parked_controllers=2,
+            max_steps=steps_per_episode,
         )
     else:
         env = ThresholdBasedProactiveSDN(
             topology_name=topology,
             num_slave_controllers=3,
             num_parked_controllers=2,
+            max_steps=steps_per_episode,
         )
 
     apply_training_reward_logic(env)
+    if int(checkpoint.get('action_dim', -1)) != env.action_space.n:
+        raise ValueError(
+            f"Checkpoint action_dim={checkpoint.get('action_dim')} is incompatible with "
+            f"environment action_dim={env.action_space.n}; retrain with the current trainer."
+        )
 
     metrics = {
         'cs_avg_latency': [],
@@ -237,10 +179,15 @@ def evaluate_model(
         'evoking_events': [],
         'migration_events': [],
         'mask_overrides': 0,
+        'oscillation_penalty_total': 0.0,
     }
 
-    for _ in range(episodes):
-        state, _ = env.reset()
+    for episode in range(episodes):
+        trace_length = len(traffic_data) if traffic_data is not None else steps_per_episode
+        start = (episode * trace_length // episodes) % trace_length
+        state, _ = env.reset(seed=seed + episode, options={'traffic_start_index': start})
+        env.last_successful_proactive_action = None
+        env.last_successful_proactive_step = -10_000
         ep_reward = 0.0
         ep_avg_latencies = []
         ep_worst_latencies = []
@@ -261,6 +208,7 @@ def evaluate_model(
             ep_worst_latencies.append(float(info.get('cs_worst_latency', info.get('worst_case_latency', 0.0))))
             ep_load_balance.append(float(info.get('load_balance_index', 0.0)))
             ep_energy.append(float(info.get('energy', 0.0)))
+            metrics['oscillation_penalty_total'] += float(info.get('oscillation_penalty', 0.0))
 
             action_type = info.get('action_type', '')
             if 'park' in action_type and info.get('action_success'):
@@ -291,6 +239,7 @@ def evaluate_model(
         'episodes': episodes,
         'steps_per_episode': steps_per_episode,
         'mask_invalid_actions': bool(mask_invalid_actions),
+        'seed': int(seed),
         'paper_results_status': PAPER_RESULTS_STATUS,
         'training_time_seconds': float(metadata.get('training_time_seconds', 0.0)) if metadata else 0.0,
         'cs_avg_latency': float(np.mean(metrics['cs_avg_latency'])),
@@ -302,6 +251,7 @@ def evaluate_model(
         'avg_evoking_events': float(np.mean(metrics['evoking_events'])),
         'avg_migration_events': float(np.mean(metrics['migration_events'])),
         'mask_overrides': int(metrics['mask_overrides']),
+        'oscillation_penalty_total': float(metrics['oscillation_penalty_total']),
         'raw_metrics': metrics,
     }
 
@@ -356,12 +306,20 @@ def main():
     parser.add_argument('--traffic', help='Optional real traffic .npy path')
     parser.add_argument('--episodes', type=int, default=10)
     parser.add_argument('--steps-per-episode', type=int, default=500)
-    parser.add_argument('--mask-invalid-actions', action='store_true')
+    parser.add_argument('--seed', type=int, default=1042)
+    parser.set_defaults(mask_invalid_actions=True)
+    parser.add_argument('--mask-invalid-actions', dest='mask_invalid_actions', action='store_true')
+    parser.add_argument('--no-mask-invalid-actions', dest='mask_invalid_actions', action='store_false')
 
     args = parser.parse_args()
 
-    model_path = args.model or f'../models/LATEST_rainbow_proactive_{args.topology}.pth'
-    traffic_path = args.traffic or f'../data/traffic/processed/{args.topology}/{args.topology}_synthetic_traffic.npy'
+    model_path = args.model or str(
+        PROJECT_ROOT / 'models' / f'LATEST_rainbow_proactive_{args.topology}.pth'
+    )
+    traffic_path = args.traffic or str(
+        PROJECT_ROOT / 'data' / 'traffic' / 'processed' / args.topology /
+        f'{args.topology}_synthetic_traffic.npy'
+    )
 
     summary = evaluate_model(
         model_path=model_path,
@@ -370,10 +328,11 @@ def main():
         steps_per_episode=args.steps_per_episode,
         mask_invalid_actions=args.mask_invalid_actions,
         traffic_path=traffic_path,
+        seed=args.seed,
     )
     print_evaluation_report(summary)
 
-    results_dir = Path('../results/evaluations')
+    results_dir = PROJECT_ROOT / 'results' / 'evaluations'
     results_dir.mkdir(parents=True, exist_ok=True)
     results_file = results_dir / f"eval_{args.topology}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     summary_clean = {key: value for key, value in summary.items() if key != 'raw_metrics'}

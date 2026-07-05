@@ -24,4 +24,10 @@ utils
 .pcap
 .pycache/
 
-sdn_prject_documentation/
+sdn_project_documentation/
+mid_evaluation/
+archives/
+research_progress_report*
+thesis_chat_summary*
+weekly_diary*
+RESEARCH_CORE_FIXES*

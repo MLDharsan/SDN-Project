@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""
-Rainbow DQN Training - CONTEXT-AWARE PROACTIVE REWARDS
+"""Train the proactive Rainbow DQN on a processed traffic trace."""
 
-FIXES:
-- Context-aware proactive bonuses (Park/Evoke only when needed)
-- Strong penalties for inaction when corrective action is needed
-- All JSON serialization issues fixed
-- get_topology_size() function included
-"""
+from __future__ import annotations
 
-import sys
+import argparse
+import json
 import os
-import torch
-import numpy as np
+import random
+import sys
 import time
+from collections import Counter
 from datetime import datetime
-from collections import deque
+from pathlib import Path
+
+import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from environments.rainbow_dqn_model import RainbowDQN  # noqa: E402
+from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN  # noqa: E402
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -23,633 +28,277 @@ except ImportError:
     SummaryWriter = None
 
 
-def train_rainbow_fixed_rewards(
-    topology='gridnet',
-    timesteps=20000,
-    mode='proactive',
-    train_freq=4,
-    convergence_window=3,
-    eval_freq=2000,
-    mask_invalid_actions=False
-):
-    """Train Rainbow DQN with context-aware proactive rewards."""
-    
-    topology = topology.strip().lower()
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    training_start_time = time.time()
+TOPOLOGY_SIZES = {
+    "gridnet": 9,
+    "bellcanada": 48,
+    "os3e": 34,
+    "interoute": 110,
+    "cogentco": 197,
+}
 
-    print(f"\n{'='*70}")
-    print(f"🚀 RAINBOW DQN TRAINING - CONTEXT-AWARE PROACTIVE REWARDS")
-    print(f"{'='*70}\n")
-    
-    print(f"Configuration:")
-    print(f"  Topology: {topology} ({get_topology_size(topology)} nodes)")
-    print(f"  Timesteps: {timesteps:,}")
-    print(f"  Mode: {mode}")
-    print(f"  Mask invalid actions: {'ON' if mask_invalid_actions else 'OFF'}")
-    print(f"  ⚡ CONTEXT-AWARE: Park/Evoke bonuses only when needed")
-    print(f"  ⚡ PENALTIES: NoAction when corrective action is needed")
-    print()
-    
-    # Import
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'environments')
-    sys.path.insert(0, env_path)
-    
-    from threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
-    from rainbow_dqn_model import RainbowDQN
-    
-    # Create environment
+
+def topology_hyperparameters(topology: str) -> dict:
+    if topology in {"interoute", "cogentco"}:
+        return {"hidden_dim": 512, "lr": 5e-5, "n_step": 5, "buffer_size": 100_000, "batch_size": 256}
+    if topology in {"bellcanada", "os3e"}:
+        return {"hidden_dim": 256, "lr": 1e-4, "n_step": 3, "buffer_size": 50_000, "batch_size": 128}
+    return {"hidden_dim": 128, "lr": 2e-4, "n_step": 3, "buffer_size": 30_000, "batch_size": 64}
+
+
+def checkpoint_payload(agent: RainbowDQN, state_dim: int, action_dim: int, config: dict) -> dict:
+    return {
+        "online_net": agent.online_net.state_dict(),
+        "target_net": agent.target_net.state_dict(),
+        "optimizer": agent.optimizer.state_dict(),
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "hyperparameters": config,
+        "reward_version": "normalized_multi_objective_v2",
+        "action_schema_version": "stable_controller_slots_v2",
+    }
+
+
+def train_rainbow_fixed_rewards(
+    topology: str = "gridnet",
+    timesteps: int = 20_000,
+    mode: str = "proactive",
+    train_freq: int = 4,
+    mask_invalid_actions: bool = True,
+    traffic_path: str | None = None,
+    seed: int = 42,
+    v_min: float = -10.0,
+    v_max: float = 10.0,
+    epsilon_start: float = 0.10,
+    epsilon_end: float = 0.01,
+) -> tuple[RainbowDQN, str]:
+    topology = topology.strip().lower()
+    if topology not in TOPOLOGY_SIZES:
+        raise ValueError(f"Unsupported topology: {topology}")
+    if v_min >= v_max:
+        raise ValueError("v_min must be lower than v_max")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    rng = np.random.default_rng(seed)
+
+    trace_path = Path(traffic_path) if traffic_path else (
+        PROJECT_ROOT / "data" / "traffic" / "processed" / topology /
+        f"{topology}_synthetic_traffic.npy"
+    )
+    if not trace_path.is_absolute():
+        trace_path = PROJECT_ROOT / trace_path
+    if not trace_path.exists():
+        raise FileNotFoundError(f"Traffic trace not found: {trace_path}")
+    traffic_data = np.load(trace_path)
+
     env = ThresholdBasedProactiveSDN(
         topology_name=topology,
         num_slave_controllers=3,
-        num_parked_controllers=2
+        num_parked_controllers=2,
+        traffic_data=traffic_data,
+        traffic_update_interval=1,
+        max_steps=1000,
     )
-    
-    # ========================================================================
-    # CONTEXT-AWARE REWARD FUNCTION
-    # ========================================================================
-    original_calculate_reward = env._calculate_reward
-    
-    def fixed_calculate_reward(action_type: str, success: bool):
-        """Context-aware reward to avoid unnecessary park/evoke actions."""
-        # Calculate base metrics
-        latency = env._calculate_latency()
-        worst_case_latency = env._calculate_worst_case_latency()
-        energy = env._calculate_energy()
-        load_variance = env._calculate_load_variance()
-        load_balance_index = env._calculate_load_balance_index()
-        
-        # Base reward (lighter scale)
-        norm_latency = latency / 20.0
-        norm_energy = energy / 1000.0
-        norm_load_var = load_variance / 1.0
-        
-        reward = -1.0 * norm_latency - 2.0 * norm_energy - 1.0 * norm_load_var
-        
-        thresholds = env._check_thresholds()
-        has_overload = bool(thresholds['overloaded'])
-        has_underload = bool(thresholds['underloaded'])
-        can_still_park = len(env.parked_slaves) < env.num_parked_controllers
-
-        if action_type == 'park' and success:
-            # Reward parking only when there is true underload and spare parking capacity.
-            reward += 200.0 if (has_underload and can_still_park) else -20.0
-        elif action_type == 'evoke' and success:
-            # Reward evoke only as overload relief; discourage needless waking.
-            reward += 200.0 if has_overload else -30.0
-        elif action_type == 'migrate' and success:
-            reward += 2.0
-        
-        if action_type == 'noop':
-            # Heavy penalty for ignoring overload
-            if has_overload:
-                reward -= 100.0
-            
-            # Penalty for not parking when there is underload and parking capacity.
-            if has_underload and can_still_park:
-                reward -= 80.0
-        
-        # Failure penalty
-        if not success and action_type != 'noop':
-            reward -= 10.0
-        
-        # Info dict
-        info = {
-            'latency': latency,
-            'cs_avg_latency': latency,
-            'worst_case_latency': worst_case_latency,
-            'cs_worst_latency': worst_case_latency,
-            'energy': energy,
-            'load_variance': load_variance,
-            'load_balance': np.sqrt(load_variance),
-            'load_balance_index': load_balance_index,
-            'active_controllers': len(env.active_slaves),
-            'parked_controllers': len(env.parked_slaves),
-            'action_type': action_type,
-            'action_success': success,
-            'overloaded_count': len(thresholds['overloaded']),
-            'underloaded_count': len(thresholds['underloaded'])
-        }
-        
-        return reward, info
-    
-    # Override the reward calculation
-    env._calculate_reward = fixed_calculate_reward
-    
-    # ========================================================================
-    # MODEL SETUP
-    # ========================================================================
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Topology-specific hyperparameters
-    if topology in ['interoute', 'cogentco']:
-        hidden_dim = 512
-        lr = 5e-5
-        n_step = 5
-        buffer_size = 100000
-        batch_size = 256
-    elif topology in ['bellcanada', 'os3e']:
-        hidden_dim = 256
-        lr = 1e-4
-        n_step = 3
-        buffer_size = 50000
-        batch_size = 128
-    else:
-        hidden_dim = 128
-        lr = 2e-4
-        n_step = 3
-        buffer_size = 30000
-        batch_size = 64
-    
+    state_dim = int(env.observation_space.shape[0])
+    action_dim = int(env.action_space.n)
+    hp = topology_hyperparameters(topology)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = {
+        **hp,
+        "gamma": 0.99,
+        "n_atoms": 51,
+        "v_min": v_min,
+        "v_max": v_max,
+        "seed": seed,
+        "epsilon_start": epsilon_start,
+        "epsilon_end": epsilon_end,
+        "traffic_update_interval": 1,
+        "mask_invalid_actions": mask_invalid_actions,
+    }
     agent = RainbowDQN(
         state_dim=state_dim,
         action_dim=action_dim,
-        hidden_dim=hidden_dim,
-        lr=lr,
+        hidden_dim=hp["hidden_dim"],
+        lr=hp["lr"],
         gamma=0.99,
-        n_step=n_step,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        device=device
+        n_step=hp["n_step"],
+        buffer_size=hp["buffer_size"],
+        batch_size=hp["batch_size"],
+        n_atoms=51,
+        v_min=v_min,
+        v_max=v_max,
+        device=device,
     )
 
-    tensorboard_writer = None
-    tensorboard_run_dir = os.path.join(
-        "logs",
-        "proactive_dqn_tensorboard",
-        f"rainbow_{mode}_{topology}_{run_timestamp}"
-    )
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = None
     if SummaryWriter is not None:
-        tensorboard_writer = SummaryWriter(log_dir=tensorboard_run_dir)
-        tensorboard_writer.add_text(
-            "run/config",
-            (
-                f"topology={topology}, timesteps={timesteps}, mode={mode}, device={device}, "
-                f"hidden_dim={hidden_dim}, lr={lr}, n_step={n_step}, "
-                f"buffer_size={buffer_size}, batch_size={batch_size}"
-            ),
-        )
-        print(f"TensorBoard log dir: {tensorboard_run_dir}")
-    else:
-        print("TensorBoard unavailable: install `tensorboard>=1.15` to enable event logging.")
-    
-    # Exploration
-    epsilon_start = 0.9
-    epsilon_end = 0.05
-    epsilon_decay = timesteps * 0.5
-    
-    def get_epsilon(step):
-        return epsilon_end + (epsilon_start - epsilon_end) * \
-               np.exp(-1.0 * step / epsilon_decay)
+        log_dir = PROJECT_ROOT / "logs" / "proactive_dqn_tensorboard" / f"rainbow_{mode}_{topology}_{run_timestamp}"
+        writer = SummaryWriter(log_dir=str(log_dir))
 
-    def select_masked_action(current_state):
-        """Choose the best valid action from the current Q-values."""
+    def reset_episode(episode: int):
+        start = (episode * env.max_steps) % len(traffic_data)
+        agent.reset_n_step()
+        return env.reset(seed=seed + episode, options={"traffic_start_index": start})[0]
+
+    def greedy_valid_action(state: np.ndarray) -> int:
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to(agent.device)
-            q_values = agent.online_net.get_q_values(state_tensor).squeeze(0)
-            raw_action = int(q_values.argmax().item())
-            valid_actions = env.get_valid_actions()
-            masked_q_values = q_values.clone()
-            invalid_actions = torch.ones_like(masked_q_values, dtype=torch.bool)
-            invalid_actions[valid_actions] = False
-            masked_q_values[invalid_actions] = -torch.inf
-            chosen_action = int(masked_q_values.argmax().item())
-            return raw_action, chosen_action, valid_actions
-    
-    # Tracking
-    episode_rewards = []
-    episode_latencies = []
-    episode_worst_latencies = []
-    episode_energies = []
-    episode_load_variances = []
-    episode_load_balance_indices = []
-    eval_rewards = deque(maxlen=convergence_window)
-    parking_events = 0
-    evoking_events = 0
-    migrate_events = 0
-    no_action_count = 0
-    invalid_action_overrides = 0
-    losses = []
-    recent_actions = deque(maxlen=200)
-    
-    # Training loop
-    state, _ = env.reset()
-    episode_reward = 0
-    episode_count = 0
-    current_episode_latencies = []
-    current_episode_worst_latencies = []
-    current_episode_energies = []
-    current_episode_load_variances = []
-    current_episode_load_balance_indices = []
-    
-    print(f"Starting training on {device}...\n")
-    print("Progress: [", end='', flush=True)
-    progress_interval = max(1, timesteps // 50)
-    
+            tensor = torch.as_tensor(state, dtype=torch.float32, device=agent.device).unsqueeze(0)
+            q_values = agent.online_net.get_q_values(tensor).squeeze(0)
+            valid = env.get_valid_actions()
+            masked = torch.full_like(q_values, -torch.inf)
+            masked[valid] = q_values[valid]
+            return int(masked.argmax().item())
+
+    def epsilon_at(step: int) -> float:
+        decay = max(1.0, timesteps * 0.6)
+        return float(epsilon_end + (epsilon_start - epsilon_end) * np.exp(-step / decay))
+
+    print("=" * 72)
+    print("RAINBOW DQN TRAINING - CONSISTENT ENVIRONMENT V2")
+    print("=" * 72)
+    print(f"Topology: {topology} ({TOPOLOGY_SIZES[topology]} switches)")
+    print(f"Traffic: {trace_path} | shape={traffic_data.shape} | one row/environment step")
+    print(f"Reward range: [-2, 1] | C51 support: [{v_min:g}, {v_max:g}] | seed={seed}")
+    print(f"State/action dimensions: {state_dim}/{action_dim} | device={device}")
+
+    started = time.time()
+    state = reset_episode(0)
+    episode = 0
+    episode_reward = 0.0
+    episode_rewards: list[float] = []
+    losses: list[float] = []
+    latencies: list[float] = []
+    energies: list[float] = []
+    load_balances: list[float] = []
+    actions: Counter[str] = Counter()
+
     for step in range(timesteps):
-        if step % progress_interval == 0:
-            print('=', end='', flush=True)
-        
-        # Traffic variation
-        if step % 100 == 0:
-            env.traffic_phase = (env.traffic_phase + 1) % 24
-            if hasattr(env, '_simulate_traffic_variation'):
-                env._simulate_traffic_variation()
-        
-        # Epsilon-greedy
-        epsilon = get_epsilon(step)
-        
-        if np.random.random() < epsilon:
-            if mask_invalid_actions:
-                valid_actions = env.get_valid_actions()
-                action = int(np.random.choice(valid_actions))
-            else:
-                action = np.random.randint(action_dim)
+        epsilon = epsilon_at(step)
+        if rng.random() < epsilon:
+            candidates = env.get_valid_actions() if mask_invalid_actions else list(range(action_dim))
+            action = int(rng.choice(candidates))
+        elif mask_invalid_actions:
+            action = greedy_valid_action(state)
         else:
-            if mask_invalid_actions:
-                raw_action, action, _ = select_masked_action(state)
-                if raw_action != action:
-                    invalid_action_overrides += 1
-            else:
-                action = agent.select_action(state, training=True)
-        
-        # Step
+            action = agent.select_action(state, training=True)
+
         next_state, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-
-        if tensorboard_writer is not None:
-            tensorboard_writer.add_scalar("train/step_reward", float(reward), step)
-            tensorboard_writer.add_scalar("train/latency", float(info.get('latency', 0.0)), step)
-            tensorboard_writer.add_scalar("train/energy", float(info.get('energy', 0.0)), step)
-            tensorboard_writer.add_scalar(
-                "train/load_variance", float(info.get('load_variance', 0.0)), step
-            )
-            tensorboard_writer.add_scalar(
-                "train/overloaded_count", float(info.get('overloaded_count', 0.0)), step
-            )
-            tensorboard_writer.add_scalar(
-                "train/underloaded_count", float(info.get('underloaded_count', 0.0)), step
-            )
-            tensorboard_writer.add_scalar(
-                "train/active_controllers", float(info.get('active_controllers', 0.0)), step
-            )
-            tensorboard_writer.add_scalar(
-                "train/parked_controllers", float(info.get('parked_controllers', 0.0)), step
-            )
-            if mask_invalid_actions:
-                tensorboard_writer.add_scalar(
-                    "train/invalid_action_overrides", float(invalid_action_overrides), step
-                )
-        
-        # Track events
-        action_type = info.get('action_type', '')
-        recent_actions.append(action_type)
-        current_episode_latencies.append(float(info.get('latency', 0.0)))
-        current_episode_worst_latencies.append(float(info.get('worst_case_latency', 0.0)))
-        current_episode_energies.append(float(info.get('energy', 0.0)))
-        current_episode_load_variances.append(float(info.get('load_variance', 0.0)))
-        current_episode_load_balance_indices.append(float(info.get('load_balance_index', 0.0)))
-        
-        if 'park' in action_type and info.get('action_success'):
-            parking_events += 1
-        elif 'evoke' in action_type and info.get('action_success'):
-            evoking_events += 1
-        elif 'migrate' in action_type and info.get('action_success'):
-            migrate_events += 1
-        elif action_type == 'noop':
-            no_action_count += 1
-        
-        # Store transition
         agent.push_n_step(state, action, reward, next_state, done)
-        
-        # Train
-        adaptive_train_freq = max(1, train_freq - (step // 10000))
-        
-        if step > 1000 and step % adaptive_train_freq == 0 and len(agent.memory) >= agent.batch_size:
+
+        if step >= 1000 and step % max(1, train_freq) == 0 and len(agent.memory) >= agent.batch_size:
             loss = agent.train_step()
             if loss is not None:
-                losses.append(loss)
-                if tensorboard_writer is not None:
-                    tensorboard_writer.add_scalar("train/loss", float(loss), step)
-        
-        # Update target
-        if step % 1000 == 0 and step > 0:
+                losses.append(float(loss))
+                if writer:
+                    writer.add_scalar("train/loss", loss, step)
+        if step > 0 and step % 1000 == 0:
             agent.update_target_network()
-        
-        episode_reward += reward
+
+        episode_reward += float(reward)
+        latencies.append(float(info["cs_avg_latency"]))
+        energies.append(float(info["energy"]))
+        load_balances.append(float(info["load_balance_index"]))
+        if info["action_success"]:
+            actions[info["action_type"]] += 1
+        if writer:
+            writer.add_scalar("train/reward", reward, step)
+            writer.add_scalar("train/latency", info["cs_avg_latency"], step)
+            writer.add_scalar("train/energy", info["energy"], step)
+
         state = next_state
-        
-        # Episode end
         if done:
             episode_rewards.append(episode_reward)
-            episode_latencies.append(
-                float(np.mean(current_episode_latencies)) if current_episode_latencies else 0.0
-            )
-            episode_energies.append(
-                float(np.mean(current_episode_energies)) if current_episode_energies else 0.0
-            )
-            episode_load_variances.append(
-                float(np.mean(current_episode_load_variances))
-                if current_episode_load_variances else 0.0
-            )
-            episode_worst_latencies.append(
-                float(np.max(current_episode_worst_latencies))
-                if current_episode_worst_latencies else 0.0
-            )
-            episode_load_balance_indices.append(
-                float(np.mean(current_episode_load_balance_indices))
-                if current_episode_load_balance_indices else 0.0
-            )
-            if tensorboard_writer is not None:
-                tensorboard_writer.add_scalar("episode/reward", float(episode_reward), episode_count)
-                tensorboard_writer.add_scalar(
-                    "episode/avg_latency", episode_latencies[-1], episode_count
-                )
-                tensorboard_writer.add_scalar(
-                    "episode/worst_latency", episode_worst_latencies[-1], episode_count
-                )
-                tensorboard_writer.add_scalar(
-                    "episode/avg_energy", episode_energies[-1], episode_count
-                )
-                tensorboard_writer.add_scalar(
-                    "episode/avg_load_variance", episode_load_variances[-1], episode_count
-                )
-                tensorboard_writer.add_scalar(
-                    "episode/load_balance_index", episode_load_balance_indices[-1], episode_count
-                )
-            episode_count += 1
-            state, _ = env.reset()
-            episode_reward = 0
-            current_episode_latencies = []
-            current_episode_worst_latencies = []
-            current_episode_energies = []
-            current_episode_load_variances = []
-            current_episode_load_balance_indices = []
-        
-        # Evaluation
-        if step % eval_freq == 0 and step > 0:
-            avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards) if episode_rewards else 0
-            eval_rewards.append(avg_reward)
-            recent_avg_latency = float(np.mean(episode_latencies[-100:])) if episode_latencies else 0.0
-            recent_avg_energy = float(np.mean(episode_energies[-100:])) if episode_energies else 0.0
-            recent_avg_load_var = (
-                float(np.mean(episode_load_variances[-100:])) if episode_load_variances else 0.0
-            )
-            
-            print(f"\n\n{'='*70}")
-            print(f"📊 Evaluation at Step {step:,} / {timesteps:,}")
-            print(f"{'='*70}")
-            print(f"Episodes: {episode_count} | Avg Reward: {avg_reward:.2f}")
-            print(f"Epsilon: {epsilon:.3f}")
-            if episode_latencies:
-                print(
-                    f"Avg Latency: {recent_avg_latency:.2f} ms | "
-                    f"Avg Energy: {recent_avg_energy:.2f} W | "
-                    f"Avg Load Var: {recent_avg_load_var:.4f}"
-                )
-            print(f"Actions - Park: {parking_events} | Evoke: {evoking_events} | Migrate: {migrate_events} | NoAction: {no_action_count}")
-            if mask_invalid_actions:
-                print(f"Masked invalid greedy choices: {invalid_action_overrides}")
-            if tensorboard_writer is not None:
-                tensorboard_writer.add_scalar("eval/avg_reward_last100", float(avg_reward), step)
-                tensorboard_writer.add_scalar("eval/avg_latency_last100", recent_avg_latency, step)
-                tensorboard_writer.add_scalar("eval/avg_energy_last100", recent_avg_energy, step)
-                tensorboard_writer.add_scalar(
-                    "eval/avg_load_variance_last100", recent_avg_load_var, step
-                )
-                tensorboard_writer.add_scalar("eval/epsilon", float(epsilon), step)
-                tensorboard_writer.add_scalar("actions/parking_events", float(parking_events), step)
-                tensorboard_writer.add_scalar("actions/evoking_events", float(evoking_events), step)
-                tensorboard_writer.add_scalar("actions/migrate_events", float(migrate_events), step)
-                tensorboard_writer.add_scalar("actions/no_action_count", float(no_action_count), step)
-                if mask_invalid_actions:
-                    tensorboard_writer.add_scalar(
-                        "actions/invalid_action_overrides", float(invalid_action_overrides), step
-                    )
-            
-            if len(losses) > 0:
-                print(f"Avg Loss: {np.mean(losses[-1000:]):.4f}")
-            
-            # Convergence check
-            if len(eval_rewards) == convergence_window:
-                reward_std = np.std(eval_rewards)
-                reward_mean = np.mean(eval_rewards)
-                
-                if reward_std < 50.0 and reward_mean > -200:
-                    print(f"\n🎉 CONVERGED! Reward std: {reward_std:.2f} < 50.0")
-                    print(f"Mean reward: {reward_mean:.2f} > -200")
-                    print(f"Stopping early at step {step}")
-                    break
-            
-            print(f"{'='*70}\n")
-            print("Progress: [", end='', flush=True)
-    
-    print("]\n")
-    
-    # Save model
-    os.makedirs('models', exist_ok=True)
-    
-    timestamp = run_timestamp
-    model_path = f'models/rainbow_{mode}_{topology}_{timesteps}steps_{timestamp}.pth'
-    
-    # Save with dimensions
-    torch.save({
-        'online_net': agent.online_net.state_dict(),
-        'target_net': agent.target_net.state_dict(),
-        'optimizer': agent.optimizer.state_dict(),
-        'state_dim': state_dim,
-        'action_dim': action_dim
-    }, model_path)
-    
-    # Metadata with proper type conversions
-    metadata_path = model_path.replace('.pth', '_metadata.json')
-    import json
-    
-    final_avg_reward = float(np.mean(episode_rewards[-100:])) if len(episode_rewards) >= 100 \
-                      else float(np.mean(episode_rewards)) if len(episode_rewards) > 0 \
-                      else 0.0
-    final_avg_latency = float(np.mean(episode_latencies)) if episode_latencies else 0.0
-    final_avg_cs_latency = final_avg_latency
-    final_worst_latency = float(np.mean(episode_worst_latencies)) if episode_worst_latencies else 0.0
-    final_std_latency = float(np.std(episode_latencies)) if episode_latencies else 0.0
-    final_avg_energy = float(np.mean(episode_energies)) if episode_energies else 0.0
-    final_std_energy = float(np.std(episode_energies)) if episode_energies else 0.0
-    final_avg_load_variance = (
-        float(np.mean(episode_load_variances)) if episode_load_variances else 0.0
-    )
-    final_std_load_variance = (
-        float(np.std(episode_load_variances)) if episode_load_variances else 0.0
-    )
-    training_time_seconds = float(time.time() - training_start_time)
-    final_avg_load_balance_index = (
-        float(np.mean(episode_load_balance_indices)) if episode_load_balance_indices else 0.0
-    )
-    
+            if writer:
+                writer.add_scalar("episode/reward", episode_reward, episode)
+            episode += 1
+            episode_reward = 0.0
+            state = reset_episode(episode)
+
+        if (step + 1) % max(1, timesteps // 10) == 0:
+            recent = np.mean(episode_rewards[-10:]) if episode_rewards else episode_reward
+            print(f"Step {step + 1:>8,}/{timesteps:,} | episodes={episode:>3} | recent reward={recent:8.2f} | epsilon={epsilon:.3f}")
+
+    if episode_reward or not episode_rewards:
+        episode_rewards.append(episode_reward)
+
+    models_dir = PROJECT_ROOT / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"rainbow_{mode}_{topology}_{timesteps}steps_{run_timestamp}.pth"
+    latest_path = models_dir / f"LATEST_rainbow_{mode}_{topology}.pth"
+    payload = checkpoint_payload(agent, state_dim, action_dim, config)
+    torch.save(payload, model_path)
+    # Keep one physical checkpoint. LATEST is a relative symlink so large
+    # topologies do not consume hundreds of extra megabytes per run.
+    latest_path.unlink(missing_ok=True)
+    latest_path.symlink_to(model_path.name)
+
     metadata = {
-        'topology': str(topology),
-        'topology_size': int(get_topology_size(topology)) if get_topology_size(topology) != 'unknown' else 'unknown',
-        'timesteps': int(timesteps),
-        'mode': str(mode),
-        'timestamp': datetime.now().isoformat(),
-        'reward_function': (
-            'CONTEXT_AWARE (Park=+200 if needed else -20, '
-            'Evoke=+200 if overloaded else -30, NoAction penalties on unmet overload/underload)'
-        ),
-        'mask_invalid_actions': bool(mask_invalid_actions),
-        
-        # Reward metrics (ALL converted to float)
-        'final_avg_reward_last100': float(final_avg_reward),
-        'final_avg_reward_all': float(np.mean(episode_rewards)) if episode_rewards else 0.0,
-        'total_cumulative_reward': float(np.sum(episode_rewards)) if episode_rewards else 0.0,
-        'best_episode_reward': float(np.max(episode_rewards)) if episode_rewards else 0.0,
-        'worst_episode_reward': float(np.min(episode_rewards)) if episode_rewards else 0.0,
-        'avg_latency': final_avg_latency,
-        'cs_avg_latency': final_avg_cs_latency,
-        'cs_worst_latency': final_worst_latency,
-        'std_latency': final_std_latency,
-        'avg_energy': final_avg_energy,
-        'std_energy': final_std_energy,
-        'avg_load_variance': final_avg_load_variance,
-        'std_load_variance': final_std_load_variance,
-        'load_balance_index': final_avg_load_balance_index,
-        
-        # Events (ALL converted to int)
-        'parking_events': int(parking_events),
-        'evoking_events': int(evoking_events),
-        'migrate_events': int(migrate_events),
-        'no_action_count': int(no_action_count),
-        'invalid_action_overrides': int(invalid_action_overrides),
-        'pe_ratio': float(parking_events / evoking_events) if evoking_events > 0 else None,
-        
-        # Training stats
-        'total_episodes': int(episode_count),
-        'avg_loss': float(np.mean(losses)) if losses else 0.0,
-        'final_epsilon': float(get_epsilon(timesteps)),
-        'training_time_seconds': training_time_seconds,
-        
-        # Model architecture
-        'state_dim': int(state_dim),
-        'action_dim': int(action_dim),
-        
-        # Hyperparameters (ALL converted)
-        'hyperparameters': {
-            'learning_rate': float(lr),
-            'gamma': 0.99,
-            'n_step': int(n_step),
-            'batch_size': int(batch_size),
-            'buffer_size': int(buffer_size),
-            'hidden_dim': int(hidden_dim),
-            'epsilon_start': float(epsilon_start),
-            'epsilon_end': float(epsilon_end)
-        }
+        "topology": topology,
+        "timesteps": timesteps,
+        "timestamp": datetime.now().isoformat(),
+        "model_path": str(model_path),
+        "traffic_path": str(trace_path),
+        "traffic_shape": list(traffic_data.shape),
+        "reward_function": "normalized_multi_objective_v2",
+        "action_schema_version": "stable_controller_slots_v2",
+        "episodes": len(episode_rewards),
+        "avg_episode_reward": float(np.mean(episode_rewards)),
+        "avg_latency": float(np.mean(latencies)),
+        "avg_energy": float(np.mean(energies)),
+        "paper_load_balance_std": float(np.mean(load_balances)),
+        "avg_loss": float(np.mean(losses)) if losses else None,
+        "successful_actions": dict(actions),
+        "training_time_seconds": time.time() - started,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "hyperparameters": config,
     }
-    
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    # Summary
-    print(f"\n{'='*70}")
-    print(f"✅ TRAINING COMPLETE!")
-    print(f"{'='*70}")
-    print(f"Model: {model_path}")
-    print(f"Metadata: {metadata_path}")
-    print(f"\n📊 Final Results:")
-    print(f"  Episodes: {episode_count}")
-    print(f"  Avg Reward (last 100): {final_avg_reward:.2f}")
-    print(f"  Avg Reward (all): {metadata['final_avg_reward_all']:.2f}")
-    print(f"  Total Reward: {metadata['total_cumulative_reward']:.2f}")
-    print(f"  Avg Latency: {final_avg_latency:.2f} ms")
-    print(f"  Avg Energy: {final_avg_energy:.2f} W")
-    print(f"  Avg Load Variance: {final_avg_load_variance:.4f}")
-    print(f"\n🎬 Action Summary:")
-    print(f"  Parking: {parking_events} | Evoking: {evoking_events}")
-    print(f"  Migrate: {migrate_events} | NoAction: {no_action_count}")
-    if mask_invalid_actions:
-        print(f"  Invalid greedy overrides: {invalid_action_overrides}")
-    if evoking_events > 0:
-        print(f"  P/E Ratio: {parking_events / evoking_events:.2f}")
-    print(f"{'='*70}\n")
-    
-    # Save as latest
-    latest_path = f'models/LATEST_rainbow_{mode}_{topology}.pth'
-    torch.save({
-        'online_net': agent.online_net.state_dict(),
-        'target_net': agent.target_net.state_dict(),
-        'optimizer': agent.optimizer.state_dict(),
-        'state_dim': state_dim,
-        'action_dim': action_dim
-    }, latest_path)
-    print(f"💡 Latest model also saved as: {latest_path}\n")
-    if tensorboard_writer is not None:
-        tensorboard_writer.add_hparams(
-            {
-                'hidden_dim': hidden_dim,
-                'learning_rate': lr,
-                'n_step': n_step,
-                'batch_size': batch_size,
-                'buffer_size': buffer_size,
-                'timesteps': timesteps,
-                'mask_invalid_actions': int(mask_invalid_actions),
-            },
-            {
-                'hparam/final_avg_reward': final_avg_reward,
-                'hparam/avg_latency': final_avg_latency,
-                'hparam/avg_energy': final_avg_energy,
-                'hparam/avg_load_variance': final_avg_load_variance,
-                'hparam/parking_events': float(parking_events),
-                'hparam/evoking_events': float(evoking_events),
-                'hparam/invalid_action_overrides': float(invalid_action_overrides),
-            }
-        )
-        tensorboard_writer.close()
-
+    metadata_path = model_path.with_name(model_path.stem + "_metadata.json")
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    if writer:
+        writer.close()
     env.close()
-    return agent, model_path
+
+    print("\nTRAINING COMPLETE")
+    print(f"Model: {model_path}")
+    print(f"Latest: {latest_path}")
+    print(f"Metadata: {metadata_path}")
+    return agent, str(model_path)
 
 
-def get_topology_size(topology):
-    """Get number of nodes in topology"""
-    sizes = {
-        'gridnet': 9,
-        'bellcanada': 48,
-        'os3e': 34,
-        'interoute': 110,
-        'cogentco': 197
-    }
-    return sizes.get(topology, 'unknown')
-
-
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Rainbow DQN Training - Aggressive Proactive Rewards')
-    parser.add_argument('--topology', default='os3e',
-                       choices=['gridnet', 'bellcanada', 'os3e', 'interoute', 'cogentco'])
-    parser.add_argument('--timesteps', type=int, default=20000)
-    parser.add_argument('--mode', default='proactive',
-                       choices=['proactive', 'reactive'])
-    parser.add_argument('--train-freq', type=int, default=4)
-    parser.add_argument(
-        '--mask-invalid-actions',
-        action='store_true',
-        help='During training, sample only valid actions and mask invalid greedy choices'
-    )
-    
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train proactive Rainbow DQN consistently.")
+    parser.add_argument("--topology", default="gridnet", choices=list(TOPOLOGY_SIZES))
+    parser.add_argument("--timesteps", type=int, default=20_000)
+    parser.add_argument("--mode", default="proactive", choices=["proactive", "reactive"])
+    parser.add_argument("--train-freq", type=int, default=4)
+    parser.add_argument("--traffic")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--v-min", type=float, default=-10.0)
+    parser.add_argument("--v-max", type=float, default=10.0)
+    parser.add_argument("--epsilon-start", type=float, default=0.10)
+    parser.add_argument("--epsilon-end", type=float, default=0.01)
+    parser.add_argument("--no-mask-invalid-actions", action="store_true")
     args = parser.parse_args()
-    
-    agent, model_path = train_rainbow_fixed_rewards(
+    train_rainbow_fixed_rewards(
         topology=args.topology,
         timesteps=args.timesteps,
         mode=args.mode,
         train_freq=args.train_freq,
-        mask_invalid_actions=args.mask_invalid_actions
+        mask_invalid_actions=not args.no_mask_invalid_actions,
+        traffic_path=args.traffic,
+        seed=args.seed,
+        v_min=args.v_min,
+        v_max=args.v_max,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
     )
-    
-    print(f"\n✅ Training complete with CONTEXT-AWARE proactive rewards!")
-    print(f"\nTo train all topologies, run:")
-    print(f"  for topo in gridnet bellcanada os3e interoute cogentco; do")
-    print(f"    python train_rainbow_fixed.py --topology $topo --timesteps 20000")
-    print(f"  done\n")
+
+
+if __name__ == "__main__":
+    main()

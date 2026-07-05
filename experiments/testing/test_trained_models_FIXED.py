@@ -191,6 +191,9 @@ class ModelTester:
     @staticmethod
     def _apply_training_reward_logic(env):
         """Match the context-aware reward shaping used during training."""
+        env.last_successful_proactive_action = None
+        env.last_successful_proactive_step = -10_000
+
         def fixed_calculate_reward(action_type: str, success: bool):
             latency = env._calculate_latency()
             worst_case_latency = env._calculate_worst_case_latency()
@@ -207,7 +210,8 @@ class ModelTester:
             thresholds = env._check_thresholds()
             has_overload = bool(thresholds['overloaded'])
             has_underload = bool(thresholds['underloaded'])
-            can_still_park = len(env.parked_slaves) < env.num_parked_controllers
+            can_still_park = len(env.active_slaves) > 1
+            oscillation_penalty = 0.0
 
             if action_type == 'park' and success:
                 reward += 200.0 if (has_underload and can_still_park) else -20.0
@@ -215,6 +219,20 @@ class ModelTester:
                 reward += 200.0 if has_overload else -30.0
             elif action_type == 'migrate' and success:
                 reward += 2.0
+
+            if success and action_type in {'park', 'evoke'}:
+                recent_flip = (
+                    env.last_successful_proactive_action is not None
+                    and env.last_successful_proactive_action != action_type
+                    and (env.time_step - env.last_successful_proactive_step) <= 5
+                )
+                if recent_flip and not has_overload:
+                    oscillation_penalty = 260.0
+                    reward -= oscillation_penalty
+                env.last_successful_proactive_action = action_type
+                env.last_successful_proactive_step = env.time_step
+            elif action_type == 'noop' and success:
+                env.last_successful_proactive_action = None
 
             if action_type == 'noop':
                 if has_overload:
@@ -239,7 +257,8 @@ class ModelTester:
                 'action_type': action_type,
                 'action_success': success,
                 'overloaded_count': len(thresholds['overloaded']),
-                'underloaded_count': len(thresholds['underloaded'])
+                'underloaded_count': len(thresholds['underloaded']),
+                'oscillation_penalty': oscillation_penalty,
             }
 
             return reward, info
@@ -327,9 +346,12 @@ class ModelTester:
         successful_parks_on_underload = 0
         action_legends = {}
         oscillation_events = 0
+        oscillation_penalty_total = 0.0
         
         for ep in range(num_episodes):
             state, _ = env.reset()
+            env.last_successful_proactive_action = None
+            env.last_successful_proactive_step = -10_000
             episode_reward = 0
             ep_parking = 0
             ep_evoking = 0
@@ -384,11 +406,12 @@ class ModelTester:
                 has_overload = info.get('overloaded_count', 0) > 0
                 has_underload = info.get('underloaded_count', 0) > 0
                 has_parked_to_evoke = info.get('parked_controllers', 0) > 0
-                has_room_to_park = info.get('parked_controllers', 0) < env.num_parked_controllers
+                has_room_to_park = len(env.active_slaves) > 1
                 overload_observations += int(has_overload)
                 underload_observations += int(has_underload)
                 overload_with_parked_capacity += int(has_overload and has_parked_to_evoke)
                 underload_with_parking_capacity += int(has_underload and has_room_to_park)
+                oscillation_penalty_total += float(info.get('oscillation_penalty', 0.0))
 
                 if 'park' in action_type and info.get('action_success'):
                     ep_parking += 1
@@ -450,7 +473,7 @@ class ModelTester:
             'test_date': datetime.now().isoformat(),
             'num_episodes': num_episodes,
             'model_used': 'Rainbow DQN (trained)',  # ✅ Not random!
-            'reward_logic': 'CONTEXT-AWARE training reward matched during evaluation',
+            'reward_logic': 'CONTEXT-AWARE + ANTI-OSCILLATION training reward matched during evaluation',
             'mask_invalid_actions': bool(self.mask_invalid_actions),
             
             # Performance metrics
@@ -495,6 +518,7 @@ class ModelTester:
             ),
             'oscillation_events': int(oscillation_events),
             'oscillation_fraction': float(oscillation_events / total_steps) if total_steps else 0.0,
+            'oscillation_penalty_total': float(oscillation_penalty_total),
             
             # Raw data
             'episode_rewards': [float(r) for r in episode_rewards],
@@ -557,6 +581,7 @@ class ModelTester:
             f"  Park/Evoke oscillations: {results['oscillation_events']} "
             f"({results['oscillation_fraction']*100:.1f}%)"
         )
+        print(f"  Oscillation penalty total: {results['oscillation_penalty_total']:.1f}")
         if results['action_id_legend']:
             legend_preview = ", ".join(
                 f"{action_id}={label}"

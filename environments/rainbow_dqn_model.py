@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple
-import random
 from collections import deque
 
 
@@ -260,6 +259,8 @@ class RainbowDQN:
         self.batch_size = batch_size
         self.device = device
         self.n_atoms = n_atoms
+        self.v_min = float(v_min)
+        self.v_max = float(v_max)
         
         # Networks
         self.online_net = DuelingNetwork(state_dim, action_dim, hidden_dim, n_atoms, v_min, v_max).to(device)
@@ -274,7 +275,7 @@ class RainbowDQN:
         self.memory = PrioritizedReplayBuffer(buffer_size)
         
         # N-step buffer
-        self.n_step_buffer = deque(maxlen=n_step)
+        self.n_step_buffer = deque()
         
         # Support for distributional RL
         self.support = torch.linspace(v_min, v_max, n_atoms).to(device)
@@ -292,19 +293,79 @@ class RainbowDQN:
         return action
     
     def push_n_step(self, state, action, reward, next_state, done):
-        """Add transition to n-step buffer"""
+        """Add a transition and flush valid n-step prefixes at episode end."""
         self.n_step_buffer.append((state, action, reward, next_state, done))
-        
-        if len(self.n_step_buffer) < self.n_step:
+
+        if len(self.n_step_buffer) < self.n_step and not done:
             return
-        
-        # Calculate n-step return
-        n_step_state, n_step_action = self.n_step_buffer[0][:2]
-        n_step_reward = sum([self.gamma**i * t[2] for i, t in enumerate(self.n_step_buffer)])
-        n_step_next_state, n_step_done = self.n_step_buffer[-1][3:]
-        
-        # Add to replay buffer
-        self.memory.push(n_step_state, n_step_action, n_step_reward, n_step_next_state, n_step_done)
+
+        while self.n_step_buffer:
+            horizon = min(self.n_step, len(self.n_step_buffer))
+            transitions = list(self.n_step_buffer)[:horizon]
+            terminal_index = next(
+                (index for index, transition in enumerate(transitions) if transition[4]),
+                None,
+            )
+            if terminal_index is not None:
+                transitions = transitions[: terminal_index + 1]
+
+            n_step_state, n_step_action = transitions[0][:2]
+            n_step_reward = sum(
+                self.gamma ** index * transition[2]
+                for index, transition in enumerate(transitions)
+            )
+            n_step_next_state = transitions[-1][3]
+            n_step_done = transitions[-1][4]
+            self.memory.push(
+                n_step_state,
+                n_step_action,
+                n_step_reward,
+                n_step_next_state,
+                n_step_done,
+            )
+            self.n_step_buffer.popleft()
+
+            if not done:
+                break
+
+    def reset_n_step(self):
+        """Clear partial returns when an episode is reset externally."""
+        self.n_step_buffer.clear()
+
+    def _project_distribution(self, rewards, dones, next_q_dist):
+        """Project Bellman-updated categorical distributions onto fixed support."""
+        target_z = rewards.unsqueeze(1) + (
+            (1 - dones.unsqueeze(1))
+            * (self.gamma ** self.n_step)
+            * self.support.unsqueeze(0)
+        )
+        target_z = target_z.clamp(self.support[0], self.support[-1])
+        b = (target_z - self.support[0]) / self.delta_z
+        lower = b.floor().long()
+        upper = b.ceil().long()
+
+        lower_weight = upper.float() - b
+        upper_weight = b - lower.float()
+        equal_atoms = lower == upper
+        lower_weight[equal_atoms] = 1.0
+        upper_weight[equal_atoms] = 0.0
+
+        batch_size = rewards.size(0)
+        projected = torch.zeros_like(next_q_dist)
+        offset = (
+            torch.arange(batch_size, device=self.device).unsqueeze(1) * self.n_atoms
+        ).expand(batch_size, self.n_atoms)
+        projected.view(-1).index_add_(
+            0,
+            (lower + offset).reshape(-1),
+            (next_q_dist * lower_weight).reshape(-1),
+        )
+        projected.view(-1).index_add_(
+            0,
+            (upper + offset).reshape(-1),
+            (next_q_dist * upper_weight).reshape(-1),
+        )
+        return projected
     
     def train_step(self):
         """Training step using all Rainbow components"""
@@ -334,21 +395,7 @@ class RainbowDQN:
             next_q_dist = self.target_net(next_states)
             next_q_dist = next_q_dist[range(self.batch_size), next_actions]
             
-            # Distributional Bellman update (C51)
-            Tz = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * (self.gamma ** self.n_step) * self.support.unsqueeze(0)
-            Tz = Tz.clamp(self.support[0], self.support[-1])
-            
-            # Project onto support
-            b = (Tz - self.support[0]) / self.delta_z
-            l = b.floor().long()
-            u = b.ceil().long()
-            
-            # Distribute probability
-            target_q_dist = torch.zeros_like(next_q_dist)
-            offset = torch.linspace(0, (self.batch_size - 1) * self.n_atoms, self.batch_size).long().unsqueeze(1).expand(self.batch_size, self.n_atoms).to(self.device)
-            
-            target_q_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_q_dist * (u.float() - b)).view(-1))
-            target_q_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_q_dist * (b - l.float())).view(-1))
+            target_q_dist = self._project_distribution(rewards, dones, next_q_dist)
         
         # Cross-entropy loss
         loss_per_sample = -(target_q_dist * q_dist.clamp(min=1e-5, max=1).log()).sum(dim=1)
@@ -381,7 +428,15 @@ class RainbowDQN:
         torch.save({
             'online_net': self.online_net.state_dict(),
             'target_net': self.target_net.state_dict(),
-            'optimizer': self.optimizer.state_dict()
+            'optimizer': self.optimizer.state_dict(),
+            'hyperparameters': {
+                'gamma': self.gamma,
+                'n_step': self.n_step,
+                'batch_size': self.batch_size,
+                'n_atoms': self.n_atoms,
+                'v_min': self.v_min,
+                'v_max': self.v_max,
+            },
         }, path)
     
     def load(self, path):
