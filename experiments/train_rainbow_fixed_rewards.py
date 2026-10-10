@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from environments.rainbow_dqn_model import RainbowDQN  # noqa: E402
 from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN  # noqa: E402
+from forecasting.gru_traffic_predictor import GRUTrafficForecaster  # noqa: E402
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -70,12 +71,17 @@ def train_rainbow_fixed_rewards(
     v_max: float = 10.0,
     epsilon_start: float = 0.10,
     epsilon_end: float = 0.01,
+    observation_mode: str = "current",
+    gru_model_path: str | None = None,
+    output_dir: str | None = None,
 ) -> tuple[RainbowDQN, str]:
     topology = topology.strip().lower()
     if topology not in TOPOLOGY_SIZES:
         raise ValueError(f"Unsupported topology: {topology}")
     if v_min >= v_max:
         raise ValueError("v_min must be lower than v_max")
+    if observation_mode not in {"current", "predictive"}:
+        raise ValueError("observation_mode must be 'current' or 'predictive'")
 
     random.seed(seed)
     np.random.seed(seed)
@@ -94,6 +100,16 @@ def train_rainbow_fixed_rewards(
         raise FileNotFoundError(f"Traffic trace not found: {trace_path}")
     traffic_data = np.load(trace_path)
 
+    predictor = None
+    resolved_gru_path = None
+    if observation_mode == "predictive":
+        resolved_gru_path = Path(gru_model_path) if gru_model_path else (
+            PROJECT_ROOT / "models" / "forecasting" / f"LATEST_gru_{topology}.pth"
+        )
+        if not resolved_gru_path.is_absolute():
+            resolved_gru_path = PROJECT_ROOT / resolved_gru_path
+        predictor = GRUTrafficForecaster(resolved_gru_path, device="cpu")
+
     env = ThresholdBasedProactiveSDN(
         topology_name=topology,
         num_slave_controllers=3,
@@ -101,6 +117,8 @@ def train_rainbow_fixed_rewards(
         traffic_data=traffic_data,
         traffic_update_interval=1,
         max_steps=1000,
+        observation_mode=observation_mode,
+        traffic_predictor=predictor,
     )
     state_dim = int(env.observation_space.shape[0])
     action_dim = int(env.action_space.n)
@@ -117,6 +135,10 @@ def train_rainbow_fixed_rewards(
         "epsilon_end": epsilon_end,
         "traffic_update_interval": 1,
         "mask_invalid_actions": mask_invalid_actions,
+        "observation_mode": observation_mode,
+        "gru_model_path": str(resolved_gru_path.resolve()) if resolved_gru_path else None,
+        "forecast_history_length": predictor.history_length if predictor else None,
+        "forecast_horizon": predictor.forecast_horizon if predictor else None,
     }
     agent = RainbowDQN(
         state_dim=state_dim,
@@ -136,7 +158,7 @@ def train_rainbow_fixed_rewards(
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     writer = None
     if SummaryWriter is not None:
-        log_dir = PROJECT_ROOT / "logs" / "proactive_dqn_tensorboard" / f"rainbow_{mode}_{topology}_{run_timestamp}"
+        log_dir = PROJECT_ROOT / "logs" / "proactive_dqn_tensorboard" / f"rainbow_{observation_mode}_{mode}_{topology}_{run_timestamp}"
         writer = SummaryWriter(log_dir=str(log_dir))
 
     def reset_episode(episode: int):
@@ -158,10 +180,16 @@ def train_rainbow_fixed_rewards(
         return float(epsilon_end + (epsilon_start - epsilon_end) * np.exp(-step / decay))
 
     print("=" * 72)
-    print("RAINBOW DQN TRAINING - CONSISTENT ENVIRONMENT V2")
+    print("RAINBOW DQN TRAINING - CONSISTENT ENVIRONMENT V3")
     print("=" * 72)
     print(f"Topology: {topology} ({TOPOLOGY_SIZES[topology]} switches)")
     print(f"Traffic: {trace_path} | shape={traffic_data.shape} | one row/environment step")
+    print(f"Observation mode: {observation_mode}")
+    if predictor:
+        print(
+            f"GRU: {resolved_gru_path} | history={predictor.history_length} | "
+            f"horizon={predictor.forecast_horizon}"
+        )
     print(f"Reward range: [-2, 1] | C51 support: [{v_min:g}, {v_max:g}] | seed={seed}")
     print(f"State/action dimensions: {state_dim}/{action_dim} | device={device}")
 
@@ -226,10 +254,19 @@ def train_rainbow_fixed_rewards(
     if episode_reward or not episode_rewards:
         episode_rewards.append(episode_reward)
 
-    models_dir = PROJECT_ROOT / "models"
+    models_dir = Path(output_dir) if output_dir else PROJECT_ROOT / "models"
+    if not models_dir.is_absolute():
+        models_dir = PROJECT_ROOT / models_dir
+    filename_prefix = "rainbow"
+    latest_prefix = "LATEST_rainbow"
+    if observation_mode == "predictive" and output_dir is None:
+        models_dir = models_dir / "predictive"
+    if observation_mode == "predictive":
+        filename_prefix = "gru_rainbow"
+        latest_prefix = "LATEST_gru_rainbow"
     models_dir.mkdir(parents=True, exist_ok=True)
-    model_path = models_dir / f"rainbow_{mode}_{topology}_{timesteps}steps_{run_timestamp}.pth"
-    latest_path = models_dir / f"LATEST_rainbow_{mode}_{topology}.pth"
+    model_path = models_dir / f"{filename_prefix}_{mode}_{topology}_{timesteps}steps_{run_timestamp}.pth"
+    latest_path = models_dir / f"{latest_prefix}_{mode}_{topology}.pth"
     payload = checkpoint_payload(agent, state_dim, action_dim, config)
     torch.save(payload, model_path)
     # Keep one physical checkpoint. LATEST is a relative symlink so large
@@ -244,6 +281,8 @@ def train_rainbow_fixed_rewards(
         "model_path": str(model_path),
         "traffic_path": str(trace_path),
         "traffic_shape": list(traffic_data.shape),
+        "observation_mode": observation_mode,
+        "gru_model_path": str(resolved_gru_path.resolve()) if resolved_gru_path else None,
         "reward_function": "normalized_multi_objective_v2",
         "action_schema_version": "stable_controller_slots_v2",
         "episodes": len(episode_rewards),
@@ -283,6 +322,11 @@ def main() -> None:
     parser.add_argument("--v-max", type=float, default=10.0)
     parser.add_argument("--epsilon-start", type=float, default=0.10)
     parser.add_argument("--epsilon-end", type=float, default=0.01)
+    parser.add_argument(
+        "--observation-mode", choices=["current", "predictive"], default="current"
+    )
+    parser.add_argument("--gru-model", help="GRU checkpoint used in predictive mode")
+    parser.add_argument("--output-dir", help="Override checkpoint output directory")
     parser.add_argument("--no-mask-invalid-actions", action="store_true")
     args = parser.parse_args()
     train_rainbow_fixed_rewards(
@@ -297,6 +341,9 @@ def main() -> None:
         v_max=args.v_max,
         epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
+        observation_mode=args.observation_mode,
+        gru_model_path=args.gru_model,
+        output_dir=args.output_dir,
     )
 
 

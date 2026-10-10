@@ -44,6 +44,7 @@ except ModuleNotFoundError:
         select_action as select_rdqn_action,
     )
 from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN  # noqa: E402
+from forecasting.gru_traffic_predictor import GRUTrafficForecaster  # noqa: E402
 
 
 TOPOLOGIES = ["gridnet", "bellcanada", "os3e", "interoute", "cogentco"]
@@ -81,6 +82,10 @@ class PolicyResult:
     overload_with_parked_capacity_fraction: float
     underload_with_parking_capacity_fraction: float
     total_steps: int
+    observation_mode: str
+    gru_model_path: str | None
+    forecast_mae: float | None
+    avg_forecast_only_actions: float
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -94,7 +99,18 @@ def load_traffic_data(traffic_path: Path | None) -> np.ndarray | None:
     return np.load(traffic_path)
 
 
-def make_env(topology: str, traffic_data: np.ndarray | None, max_steps: int):
+def make_env(
+    topology: str,
+    traffic_data: np.ndarray | None,
+    max_steps: int,
+    observation_mode: str = "current",
+    gru_model_path: Path | None = None,
+):
+    predictor = (
+        GRUTrafficForecaster(gru_model_path, device="cpu")
+        if observation_mode == "predictive"
+        else None
+    )
     return ThresholdBasedProactiveSDN(
         topology_name=topology,
         num_slave_controllers=3,
@@ -102,6 +118,8 @@ def make_env(topology: str, traffic_data: np.ndarray | None, max_steps: int):
         traffic_data=traffic_data,
         traffic_update_interval=1,
         max_steps=max_steps,
+        observation_mode=observation_mode,
+        traffic_predictor=predictor,
     )
 
 
@@ -160,9 +178,13 @@ def evaluate_policy(
     traffic_path: Path | None,
     model_path: Path | None,
     seed: int,
+    observation_mode: str = "current",
+    gru_model_path: Path | None = None,
 ) -> PolicyResult:
     traffic_data = load_traffic_data(traffic_path)
-    env = make_env(topology, traffic_data, steps_per_episode)
+    env = make_env(
+        topology, traffic_data, steps_per_episode, observation_mode, gru_model_path
+    )
     rng = np.random.default_rng(seed)
 
     rdqn_model = None
@@ -175,6 +197,11 @@ def evaluate_policy(
                 f"Checkpoint action_dim={checkpoint.get('action_dim')} is incompatible with "
                 f"environment action_dim={env.action_space.n}. Retrain this topology with "
                 "train_rainbow_fixed_rewards.py after the stable action-schema fix."
+            )
+        if int(checkpoint.get("state_dim", -1)) != env.observation_space.shape[0]:
+            raise ValueError(
+                f"Checkpoint state_dim={checkpoint.get('state_dim')} is incompatible with "
+                f"{observation_mode} observation state_dim={env.observation_space.shape[0]}."
             )
 
     episode_rewards = []
@@ -189,6 +216,8 @@ def evaluate_policy(
     episode_migrations = []
     episode_noops = []
     episode_failures = []
+    forecast_errors = []
+    episode_forecast_only_actions = []
     overload_steps = 0
     underload_steps = 0
     overload_with_parked_capacity_steps = 0
@@ -197,9 +226,10 @@ def evaluate_policy(
 
     for episode in range(episodes):
         trace_length = len(traffic_data) if traffic_data is not None else steps_per_episode
-        # Stratified starts cover low, normal, and peak periods instead of only
-        # evaluating the low-load prefix of a chronologically ordered trace.
-        start = (episode * trace_length // episodes) % trace_length
+        # Keep each chronological evaluation window inside its split; wrapping
+        # the end back to the beginning would create an artificial time jump.
+        max_start = max(0, trace_length - steps_per_episode)
+        start = 0 if episodes <= 1 else episode * max_start // (episodes - 1)
         state, _ = env.reset(
             seed=seed + episode, options={"traffic_start_index": start}
         )
@@ -216,6 +246,7 @@ def evaluate_policy(
         ep_migrations = 0
         ep_noops = 0
         ep_failures = 0
+        ep_forecast_only_actions = 0
 
         for _step in range(steps_per_episode):
             if policy == "rdqn":
@@ -267,6 +298,15 @@ def evaluate_policy(
 
             if not action_success and action_type != "noop":
                 ep_failures += 1
+            forecast_mae = info.get("forecast_mae")
+            if forecast_mae is not None:
+                forecast_errors.append(float(forecast_mae))
+            if (
+                info.get("forecast_only_overload")
+                and action_success
+                and action_type in {"evoke", "migrate"}
+            ):
+                ep_forecast_only_actions += 1
 
             state = next_state
             if terminated or truncated:
@@ -284,6 +324,7 @@ def evaluate_policy(
         episode_migrations.append(ep_migrations)
         episode_noops.append(ep_noops)
         episode_failures.append(ep_failures)
+        episode_forecast_only_actions.append(ep_forecast_only_actions)
 
     env.close()
 
@@ -320,6 +361,10 @@ def evaluate_policy(
             float(underload_with_parking_capacity_steps / total_steps) if total_steps else 0.0
         ),
         total_steps=int(total_steps),
+        observation_mode=observation_mode,
+        gru_model_path=str(gru_model_path) if gru_model_path else None,
+        forecast_mae=float(np.mean(forecast_errors)) if forecast_errors else None,
+        avg_forecast_only_actions=float(np.mean(episode_forecast_only_actions)),
     )
 
 
@@ -393,6 +438,15 @@ def main() -> None:
     parser.add_argument("--steps-per-episode", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--observation-mode", choices=["current", "predictive"], default="current"
+    )
+    parser.add_argument(
+        "--traffic-split",
+        choices=["full", "train", "validation", "test"],
+        default="full",
+    )
+    parser.add_argument("--gru-model-dir", default="models/forecasting")
+    parser.add_argument(
         "--model-dir",
         default="models",
         help="Directory containing LATEST_rainbow_proactive_<topology>.pth checkpoints.",
@@ -411,18 +465,27 @@ def main() -> None:
 
     results = []
     for topology in topologies:
-        traffic_path = (
-            PROJECT_ROOT
-            / "data"
-            / "traffic"
-            / "processed"
-            / topology
-            / f"{topology}_synthetic_traffic.npy"
-        )
+        traffic_path = PROJECT_ROOT / "data" / "traffic" / "processed" / topology
+        if args.traffic_split == "full":
+            traffic_path = traffic_path / f"{topology}_synthetic_traffic.npy"
+        else:
+            traffic_path = traffic_path / "splits" / f"{topology}_{args.traffic_split}.npy"
         model_dir = Path(args.model_dir)
         if not model_dir.is_absolute():
             model_dir = PROJECT_ROOT / model_dir
-        model_path = model_dir / f"LATEST_rainbow_proactive_{topology}.pth"
+        if args.observation_mode == "predictive":
+            model_dir = model_dir / "predictive" if model_dir == PROJECT_ROOT / "models" else model_dir
+            model_path = model_dir / f"LATEST_gru_rainbow_proactive_{topology}.pth"
+        else:
+            model_path = model_dir / f"LATEST_rainbow_proactive_{topology}.pth"
+        gru_model_dir = Path(args.gru_model_dir)
+        if not gru_model_dir.is_absolute():
+            gru_model_dir = PROJECT_ROOT / gru_model_dir
+        gru_model_path = (
+            gru_model_dir / f"LATEST_gru_{topology}.pth"
+            if args.observation_mode == "predictive"
+            else None
+        )
 
         for policy in policies:
             print(f"\nEvaluating topology={topology}, policy={policy}...")
@@ -434,6 +497,8 @@ def main() -> None:
                 traffic_path=traffic_path,
                 model_path=model_path if policy == "rdqn" else None,
                 seed=args.seed,
+                observation_mode=args.observation_mode,
+                gru_model_path=gru_model_path,
             )
             results.append(result)
 

@@ -22,6 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from environments.rainbow_dqn_model import RainbowDQN
 from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
+from forecasting.gru_traffic_predictor import GRUTrafficForecaster
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,6 +128,8 @@ def evaluate_model(
     mask_invalid_actions: bool = False,
     traffic_path: str | None = None,
     seed: int = 1042,
+    observation_mode: str = 'current',
+    gru_model_path: str | None = None,
 ):
     model_path = Path(model_path)
     if not model_path.exists():
@@ -146,6 +149,12 @@ def evaluate_model(
             raise FileNotFoundError(f"Traffic trace not found: {traffic_path}")
         traffic_data = np.load(traffic_path)
 
+    predictor = None
+    if observation_mode == 'predictive':
+        if not gru_model_path:
+            raise ValueError("Predictive evaluation requires gru_model_path")
+        predictor = GRUTrafficForecaster(gru_model_path, device='cpu')
+
     if traffic_data is not None:
         env = RealTrafficEvaluationEnvironment(
             traffic_data=traffic_data,
@@ -153,6 +162,8 @@ def evaluate_model(
             num_slave_controllers=3,
             num_parked_controllers=2,
             max_steps=steps_per_episode,
+            observation_mode=observation_mode,
+            traffic_predictor=predictor,
         )
     else:
         env = ThresholdBasedProactiveSDN(
@@ -160,6 +171,8 @@ def evaluate_model(
             num_slave_controllers=3,
             num_parked_controllers=2,
             max_steps=steps_per_episode,
+            observation_mode=observation_mode,
+            traffic_predictor=predictor,
         )
 
     apply_training_reward_logic(env)
@@ -167,6 +180,11 @@ def evaluate_model(
         raise ValueError(
             f"Checkpoint action_dim={checkpoint.get('action_dim')} is incompatible with "
             f"environment action_dim={env.action_space.n}; retrain with the current trainer."
+        )
+    if int(checkpoint.get('state_dim', -1)) != env.observation_space.shape[0]:
+        raise ValueError(
+            f"Checkpoint state_dim={checkpoint.get('state_dim')} is incompatible with "
+            f"{observation_mode} state_dim={env.observation_space.shape[0]}."
         )
 
     metrics = {
@@ -184,7 +202,8 @@ def evaluate_model(
 
     for episode in range(episodes):
         trace_length = len(traffic_data) if traffic_data is not None else steps_per_episode
-        start = (episode * trace_length // episodes) % trace_length
+        max_start = max(0, trace_length - steps_per_episode)
+        start = 0 if episodes <= 1 else episode * max_start // (episodes - 1)
         state, _ = env.reset(seed=seed + episode, options={'traffic_start_index': start})
         env.last_successful_proactive_action = None
         env.last_successful_proactive_step = -10_000
@@ -240,6 +259,8 @@ def evaluate_model(
         'steps_per_episode': steps_per_episode,
         'mask_invalid_actions': bool(mask_invalid_actions),
         'seed': int(seed),
+        'observation_mode': observation_mode,
+        'gru_model_path': gru_model_path,
         'paper_results_status': PAPER_RESULTS_STATUS,
         'training_time_seconds': float(metadata.get('training_time_seconds', 0.0)) if metadata else 0.0,
         'cs_avg_latency': float(np.mean(metrics['cs_avg_latency'])),
@@ -310,16 +331,34 @@ def main():
     parser.set_defaults(mask_invalid_actions=True)
     parser.add_argument('--mask-invalid-actions', dest='mask_invalid_actions', action='store_true')
     parser.add_argument('--no-mask-invalid-actions', dest='mask_invalid_actions', action='store_false')
+    parser.add_argument(
+        '--observation-mode', choices=['current', 'predictive'], default='current'
+    )
+    parser.add_argument('--traffic-split', choices=['full', 'train', 'validation', 'test'], default='full')
+    parser.add_argument('--gru-model')
 
     args = parser.parse_args()
 
-    model_path = args.model or str(
-        PROJECT_ROOT / 'models' / f'LATEST_rainbow_proactive_{args.topology}.pth'
+    if args.observation_mode == 'predictive':
+        default_model = (
+            PROJECT_ROOT / 'models' / 'predictive' /
+            f'LATEST_gru_rainbow_proactive_{args.topology}.pth'
+        )
+    else:
+        default_model = PROJECT_ROOT / 'models' / f'LATEST_rainbow_proactive_{args.topology}.pth'
+    model_path = args.model or str(default_model)
+    traffic_base = PROJECT_ROOT / 'data' / 'traffic' / 'processed' / args.topology
+    default_traffic = (
+        traffic_base / f'{args.topology}_synthetic_traffic.npy'
+        if args.traffic_split == 'full'
+        else traffic_base / 'splits' / f'{args.topology}_{args.traffic_split}.npy'
     )
-    traffic_path = args.traffic or str(
-        PROJECT_ROOT / 'data' / 'traffic' / 'processed' / args.topology /
-        f'{args.topology}_synthetic_traffic.npy'
-    )
+    traffic_path = args.traffic or str(default_traffic)
+    gru_model_path = args.gru_model
+    if args.observation_mode == 'predictive' and not gru_model_path:
+        gru_model_path = str(
+            PROJECT_ROOT / 'models' / 'forecasting' / f'LATEST_gru_{args.topology}.pth'
+        )
 
     summary = evaluate_model(
         model_path=model_path,
@@ -329,6 +368,8 @@ def main():
         mask_invalid_actions=args.mask_invalid_actions,
         traffic_path=traffic_path,
         seed=args.seed,
+        observation_mode=args.observation_mode,
+        gru_model_path=gru_model_path,
     )
     print_evaluation_report(summary)
 

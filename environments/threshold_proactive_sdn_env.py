@@ -7,7 +7,8 @@ One environment step represents one controller decision interval.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Dict, List, Optional, Protocol, Tuple
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -15,6 +16,13 @@ import networkx as nx
 import numpy as np
 
 from utils.topology_loader import TopologyLoader
+
+
+class TrafficPredictor(Protocol):
+    history_length: int
+    forecast_horizon: int
+
+    def predict(self, history: np.ndarray) -> np.ndarray: ...
 
 
 class ThresholdBasedProactiveSDN(gym.Env):
@@ -32,6 +40,8 @@ class ThresholdBasedProactiveSDN(gym.Env):
         traffic_update_interval: int = 1,
         max_steps: int = 1000,
         allow_topology_fallback: bool = False,
+        observation_mode: str = "current",
+        traffic_predictor: Optional[TrafficPredictor] = None,
     ):
         super().__init__()
         if num_slave_controllers < 1:
@@ -42,6 +52,10 @@ class ThresholdBasedProactiveSDN(gym.Env):
             raise ValueError("Expected 0 <= underload_threshold < overload_threshold <= 1")
         if traffic_update_interval < 1:
             raise ValueError("traffic_update_interval must be at least 1")
+        if observation_mode not in {"current", "predictive"}:
+            raise ValueError("observation_mode must be 'current' or 'predictive'")
+        if observation_mode == "predictive" and traffic_predictor is None:
+            raise ValueError("Predictive observation mode requires a traffic_predictor")
 
         self.topology_name = self._normalize_topology_name(topology_name)
         self.num_slave_controllers = num_slave_controllers
@@ -53,6 +67,8 @@ class ThresholdBasedProactiveSDN(gym.Env):
         self.traffic_update_interval = traffic_update_interval
         self.max_steps = max_steps
         self.allow_topology_fallback = allow_topology_fallback
+        self.observation_mode = observation_mode
+        self.traffic_predictor = traffic_predictor
 
         self.topology_loader = TopologyLoader()
         self.controller_host_nodes: List[int] = []
@@ -73,6 +89,15 @@ class ThresholdBasedProactiveSDN(gym.Env):
         self.switch_to_controller: Dict[int, int] = {}
         self.controller_loads = {i: 0.0 for i in range(self.total_controllers)}
         self.current_switch_loads = np.zeros(self.num_switches, dtype=np.float32)
+        self.predicted_switch_loads = np.zeros(self.num_switches, dtype=np.float32)
+        self.predicted_controller_loads = np.zeros(self.total_controllers, dtype=np.float32)
+        history_length = getattr(traffic_predictor, "history_length", 1)
+        if traffic_predictor is not None and traffic_predictor.config.num_switches != self.num_switches:
+            raise ValueError(
+                f"Predictor has {traffic_predictor.config.num_switches} switches; "
+                f"topology has {self.num_switches}"
+            )
+        self.traffic_history = deque(maxlen=history_length)
 
         self.energy_active = 100.0
         self.energy_parked = 10.0
@@ -156,6 +181,8 @@ class ThresholdBasedProactiveSDN(gym.Env):
 
     def _setup_spaces(self) -> None:
         obs_size = self.total_controllers * 2 + self.num_switches
+        if self.observation_mode == "predictive":
+            obs_size += self.num_switches + self.total_controllers
         self.observation_space = spaces.Box(
             low=0, high=1, shape=(obs_size,), dtype=np.float32
         )
@@ -189,7 +216,10 @@ class ThresholdBasedProactiveSDN(gym.Env):
             ],
             dtype=np.float32,
         )
-        return np.concatenate([loads, active_status, assignments]).astype(np.float32)
+        parts = [loads, active_status, assignments]
+        if self.observation_mode == "predictive":
+            parts.extend([self.predicted_switch_loads, self.predicted_controller_loads])
+        return np.concatenate(parts).astype(np.float32)
 
     def _next_switch_loads(self) -> np.ndarray:
         if self.traffic_data is not None:
@@ -212,7 +242,56 @@ class ThresholdBasedProactiveSDN(gym.Env):
 
     def _simulate_traffic_variation(self) -> None:
         self.current_switch_loads = self._next_switch_loads()
+        self.traffic_history.append(self.current_switch_loads.copy())
         self._recompute_controller_loads()
+        self._update_prediction()
+
+    def _prime_traffic_history(self, start_index: int) -> None:
+        self.traffic_history.clear()
+        if self.traffic_data is None or self.observation_mode != "predictive":
+            return
+        needed = self.traffic_history.maxlen - 1
+        first_index = max(0, start_index - needed)
+        prior_rows = [row.copy() for row in self.traffic_data[first_index:start_index]]
+        pad_row = (
+            prior_rows[0]
+            if prior_rows
+            else self.traffic_data[min(start_index, len(self.traffic_data) - 1)].copy()
+        )
+        for _ in range(needed - len(prior_rows)):
+            self.traffic_history.append(pad_row.copy())
+        self.traffic_history.extend(prior_rows)
+
+    def _controller_loads_from_switch_values(self, switch_values: np.ndarray) -> np.ndarray:
+        return self._controller_loads_for_mapping_values(
+            self.switch_to_controller, switch_values
+        )
+
+    def _controller_loads_for_mapping_values(
+        self, mapping: Dict[int, int], switch_values: np.ndarray
+    ) -> np.ndarray:
+        totals = np.zeros(self.total_controllers, dtype=np.float32)
+        counts = np.zeros(self.total_controllers, dtype=np.int32)
+        for switch_id, controller_id in mapping.items():
+            if controller_id in self.active_slaves:
+                totals[controller_id] += float(switch_values[switch_id])
+                counts[controller_id] += 1
+        mask = counts > 0
+        totals[mask] /= counts[mask]
+        return np.clip(totals, 0, 1)
+
+    def _update_prediction(self) -> None:
+        if self.observation_mode != "predictive":
+            self.predicted_switch_loads.fill(0)
+            self.predicted_controller_loads.fill(0)
+            return
+        if len(self.traffic_history) != self.traffic_history.maxlen:
+            raise RuntimeError("Traffic history was not fully initialized")
+        history = np.asarray(self.traffic_history, dtype=np.float32)
+        self.predicted_switch_loads = self.traffic_predictor.predict(history)
+        self.predicted_controller_loads = self._controller_loads_from_switch_values(
+            self.predicted_switch_loads
+        )
 
     def _loads_for_mapping(self, mapping: Dict[int, int]) -> Dict[int, float]:
         loads = {i: 0.0 for i in range(self.total_controllers)}
@@ -231,6 +310,10 @@ class ThresholdBasedProactiveSDN(gym.Env):
 
     def _recompute_controller_loads(self) -> None:
         self.controller_loads = self._loads_for_mapping(self.switch_to_controller)
+        if self.observation_mode == "predictive":
+            self.predicted_controller_loads = self._controller_loads_from_switch_values(
+                self.predicted_switch_loads
+            )
 
     def _check_thresholds(self) -> Dict[str, List[int]]:
         overloaded, underloaded, normal = [], [], []
@@ -244,9 +327,33 @@ class ThresholdBasedProactiveSDN(gym.Env):
                 normal.append(controller_id)
         return {"overloaded": overloaded, "underloaded": underloaded, "normal": normal}
 
+    def _check_predicted_thresholds(self) -> Dict[str, List[int]]:
+        overloaded, underloaded, normal = [], [], []
+        for controller_id in sorted(self.active_slaves):
+            load = float(self.predicted_controller_loads[controller_id])
+            if load > self.overload_threshold:
+                overloaded.append(controller_id)
+            elif load < self.underload_threshold:
+                underloaded.append(controller_id)
+            else:
+                normal.append(controller_id)
+        return {"overloaded": overloaded, "underloaded": underloaded, "normal": normal}
+
+    def _decision_thresholds(self) -> Dict[str, List[int]]:
+        current = self._check_thresholds()
+        if self.observation_mode != "predictive":
+            return current
+        predicted = self._check_predicted_thresholds()
+        return {
+            "overloaded": sorted(set(current["overloaded"]) | set(predicted["overloaded"])),
+            # Parking remains based on current underload to avoid dropping capacity early.
+            "underloaded": current["underloaded"],
+            "normal": current["normal"],
+        }
+
     def get_valid_actions(self) -> List[int]:
         valid_actions = [0]
-        thresholds = self._check_thresholds()
+        thresholds = self._decision_thresholds()
 
         overloaded = set(thresholds["overloaded"])
         if overloaded:
@@ -313,7 +420,15 @@ class ThresholdBasedProactiveSDN(gym.Env):
             return False
         candidate_mapping = dict(self.switch_to_controller)
         candidate_mapping[switch_id] = target
-        return self._loads_for_mapping(candidate_mapping)[target] <= self.overload_threshold
+        current_safe = (
+            self._loads_for_mapping(candidate_mapping)[target] <= self.overload_threshold
+        )
+        if self.observation_mode != "predictive":
+            return current_safe
+        predicted_loads = self._controller_loads_for_mapping_values(
+            candidate_mapping, self.predicted_switch_loads
+        )
+        return current_safe and predicted_loads[target] <= self.overload_threshold
 
     def _can_park_controller(self, controller_id: int) -> bool:
         if controller_id not in self.active_slaves or len(self.active_slaves) <= 1:
@@ -347,16 +462,26 @@ class ThresholdBasedProactiveSDN(gym.Env):
         self.active_slaves.add(controller_id)
         self._recompute_controller_loads()
 
-        overloaded = self._check_thresholds()["overloaded"]
+        overloaded = self._decision_thresholds()["overloaded"]
         if overloaded:
-            source = max(overloaded, key=lambda item: self.controller_loads[item])
+            source = max(
+                overloaded,
+                key=lambda item: max(
+                    self.controller_loads[item], self.predicted_controller_loads[item]
+                ),
+            )
             candidates = [
                 switch_id
                 for switch_id, assigned in self.switch_to_controller.items()
                 if assigned == source
             ]
             if candidates:
-                switch_id = max(candidates, key=lambda item: self.current_switch_loads[item])
+                switch_id = max(
+                    candidates,
+                    key=lambda item: max(
+                        self.current_switch_loads[item], self.predicted_switch_loads[item]
+                    ),
+                )
                 self._migrate_switch(switch_id, controller_id)
         self._recompute_controller_loads()
         return True
@@ -404,10 +529,17 @@ class ThresholdBasedProactiveSDN(gym.Env):
         candidates = [item for item in self.active_slaves if item != source]
         if not candidates:
             return None
+        if self.observation_mode == "predictive":
+            return min(
+                candidates,
+                key=lambda item: max(
+                    self.controller_loads[item], self.predicted_controller_loads[item]
+                ),
+            )
         return min(candidates, key=lambda item: self.controller_loads[item])
 
     def _execute_action(self, action: int) -> Tuple[str, bool]:
-        thresholds = self._check_thresholds()
+        thresholds = self._decision_thresholds()
         if action == 0:
             return "noop", True
         if 1 <= action <= self.num_switches:
@@ -542,6 +674,18 @@ class ThresholdBasedProactiveSDN(gym.Env):
 
         reward = float(np.clip(base_reward + action_adjustment - oscillation_penalty, -2, 1))
         thresholds = self._check_thresholds()
+        forecast_mae = None
+        if self.observation_mode == "predictive" and self.traffic_data is not None:
+            current_index = self.traffic_index - 1
+            target_index = current_index + self.traffic_predictor.forecast_horizon
+            if 0 <= target_index < len(self.traffic_data):
+                forecast_mae = float(
+                    np.mean(
+                        np.abs(
+                            self.predicted_switch_loads - self.traffic_data[target_index]
+                        )
+                    )
+                )
         info = {
             "latency": latency,
             "cs_avg_latency": latency,
@@ -560,6 +704,16 @@ class ThresholdBasedProactiveSDN(gym.Env):
             "underloaded_count": len(thresholds["underloaded"]),
             "pre_overloaded_count": len(context.get("overloaded", [])),
             "pre_underloaded_count": len(context.get("underloaded", [])),
+            "predicted_overloaded_count": len(
+                self._check_predicted_thresholds()["overloaded"]
+            ) if self.observation_mode == "predictive" else 0,
+            "current_overloaded_count": len(context.get("current_overloaded", [])),
+            "forecast_only_overload": bool(
+                context.get("predicted_overloaded")
+                and not context.get("current_overloaded")
+            ),
+            "forecast_mae": forecast_mae,
+            "observation_mode": self.observation_mode,
             "oscillation_penalty": oscillation_penalty,
             "base_reward": base_reward,
             "action_adjustment": action_adjustment,
@@ -568,11 +722,24 @@ class ThresholdBasedProactiveSDN(gym.Env):
         return reward, info
 
     def step(self, action: int):
-        thresholds = self._check_thresholds()
+        current_thresholds = self._check_thresholds()
+        predicted_thresholds = (
+            self._check_predicted_thresholds()
+            if self.observation_mode == "predictive"
+            else {"overloaded": [], "underloaded": [], "normal": []}
+        )
+        thresholds = self._decision_thresholds()
         context = {
-            "overloaded": list(thresholds["overloaded"]),
-            "underloaded": list(thresholds["underloaded"]),
-            "can_park": bool(thresholds["underloaded"] and len(self.active_slaves) > 1),
+            # Rewards use actual current conditions in both modes. Forecasts
+            # expand predictive action availability but never redefine score.
+            "overloaded": list(current_thresholds["overloaded"]),
+            "underloaded": list(current_thresholds["underloaded"]),
+            "can_park": bool(
+                current_thresholds["underloaded"] and len(self.active_slaves) > 1
+            ),
+            "current_overloaded": list(current_thresholds["overloaded"]),
+            "predicted_overloaded": list(predicted_thresholds["overloaded"]),
+            "decision_overloaded": list(thresholds["overloaded"]),
         }
         action_type, success = self._execute_action(int(action))
         reward, info = self._calculate_reward(action_type, success, context)
@@ -596,6 +763,7 @@ class ThresholdBasedProactiveSDN(gym.Env):
         self.traffic_index = int(options.get("traffic_start_index", 0))
         self.last_successful_proactive_action = None
         self.last_successful_proactive_step = -10_000
+        self._prime_traffic_history(self.traffic_index)
         self._simulate_traffic_variation()
         return self._get_observation(), {
             "traffic_index": self.traffic_index,

@@ -1,6 +1,7 @@
 """Regression tests for the shared training and fair-evaluation core."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -8,6 +9,19 @@ import torch
 from environments.rainbow_dqn_model import RainbowDQN
 from environments.threshold_proactive_sdn_env import ThresholdBasedProactiveSDN
 from experiments.evaluate_fair_baselines import select_threshold_action
+from experiments.preprocessing.split_traffic_temporal import split_temporally
+
+
+class ConstantPredictor:
+    history_length = 4
+    forecast_horizon = 2
+
+    def __init__(self, num_switches, value):
+        self.config = SimpleNamespace(num_switches=num_switches)
+        self.value = value
+
+    def predict(self, history):
+        return np.full(history.shape[1], self.value, dtype=np.float32)
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -37,6 +51,46 @@ class EnvironmentTests(unittest.TestCase):
         _, reward, _, _, _ = env.step(select_threshold_action(env))
         self.assertGreaterEqual(reward, -2.0)
         self.assertLessEqual(reward, 1.0)
+
+    def test_predictive_mode_expands_state_without_changing_current_mode(self):
+        trace = np.full((20, 9), 0.5, dtype=np.float32)
+        current = ThresholdBasedProactiveSDN("gridnet", traffic_data=trace, max_steps=10)
+        predictive = ThresholdBasedProactiveSDN(
+            "gridnet",
+            traffic_data=trace,
+            max_steps=10,
+            observation_mode="predictive",
+            traffic_predictor=ConstantPredictor(9, 0.9),
+        )
+        current_state, _ = current.reset(seed=42)
+        predictive_state, _ = predictive.reset(seed=42)
+        self.assertEqual(current_state.shape, (21,))
+        self.assertEqual(predictive_state.shape, (36,))
+
+    def test_forecasted_overload_allows_early_evoke(self):
+        trace = np.full((20, 9), 0.5, dtype=np.float32)
+        env = ThresholdBasedProactiveSDN(
+            "gridnet",
+            traffic_data=trace,
+            max_steps=10,
+            observation_mode="predictive",
+            traffic_predictor=ConstantPredictor(9, 0.9),
+        )
+        env.reset(seed=42)
+        self.assertEqual(env._check_thresholds()["overloaded"], [])
+        evoke_action = env.action_for_evoke(min(env.parked_slaves))
+        self.assertIn(evoke_action, env.get_valid_actions())
+        _state, _reward, _terminated, _truncated, info = env.step(evoke_action)
+        self.assertEqual(info["action_type"], "evoke")
+        self.assertTrue(info["action_success"])
+
+    def test_temporal_split_preserves_order_and_boundaries(self):
+        data = np.arange(100, dtype=np.float32).reshape(50, 2)
+        train, validation, test, metadata = split_temporally(data)
+        self.assertTrue(np.array_equal(train[-1], data[34]))
+        self.assertTrue(np.array_equal(validation[0], data[35]))
+        self.assertTrue(np.array_equal(test[0], data[42]))
+        self.assertEqual(metadata["train_range"], [0, 35])
 
 
 class RainbowTests(unittest.TestCase):
