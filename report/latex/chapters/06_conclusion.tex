@@ -1,0 +1,36 @@
+\chapter{Conclusion}
+\label{ch:conclusion}
+
+\section{Summary of Research and Key Findings}
+
+This research studied runtime controller management in distributed SDN as a sequential decision problem. A Rainbow DQN agent, acting as the master controller, observed controller loads, controller states and the switch mapping, optionally with GRU forecasts of near-future load. At each interval it chose to migrate a switch, park or evoke a controller, or do nothing. A valid-action mechanism kept every decision executable, and a bounded reward balanced latency, modelled energy and load balance. The framework was evaluated on five Topology Zoo networks of 9 to 197 switches, on synthetic and Abilene-derived traffic, against threshold, random-valid and no-op policies run under identical conditions, with chronological splits and single-use test sets.
+
+The key findings are as follows.
+\begin{enumerate}[leftmargin=*]
+  \item On held-out synthetic traffic, the selected learned policy achieved the \textbf{highest reward on all five topologies} and used \textbf{4.2--19.6\% less simulated energy} than threshold control, with the saving growing with network size. The price was a small increase in average latency (0.2--0.8\,ms) on four of the five topologies.
+  \item The gain comes mainly from \textbf{energy-aware restraint}. The agent learned to add controllers less often than a reactive rule and to park them when possible, while still relieving overload through migration. No failed actions occurred in any final evaluation.
+  \item \textbf{Forecasting is scenario-dependent.} The GRU beat persistence on three of five synthetic topologies. Predictive GRU-RDQN clearly improved OS3E (reward $-478.46\rightarrow-452.94$, energy $442.18\rightarrow380.89$\,W relative to current RDQN), but not Gridnet or BellCanada.
+  \item On \textbf{real traffic dynamics}, synthetic-trained policies transferred zero-shot without failures and still beat the baselines. After real-data training, the two modes could not be separated over three seeds (predictive mean reward $-111.19\pm17.53$ versus $-121.80\pm20.14$, with current RDQN better in two of three seeds).
+  \item Larger topologies need larger training budgets: Cogentco required 120k rather than 80k steps.
+\end{enumerate}
+
+\section{Research Contributions}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{A runtime controller-management formulation} in which a single learned discrete policy jointly chooses switch migration, controller parking, controller evoking and no action, with a stable action schema, valid-action masking and feasibility checks.
+  \item \textbf{A proactive extension with a controlled ablation}: a frozen GRU forecaster integrated conservatively, with forecasts allowed to anticipate overload but not to remove capacity or alter rewards, and evaluated against an otherwise identical current-state agent.
+  \item \textbf{A leakage-controlled evaluation protocol and evidence across scales}: chronological splits, validation-only selection, single-use tests, identical-condition baselines, zero-shot transfer and three-seed real-data replication over five topologies.
+  \item \textbf{Reproducible artefacts}: versioned checkpoints with metadata, CSV/JSON results, regression tests and scripts that regenerate every figure and table in this report from the stored results.
+\end{enumerate}
+The contribution lies in the integration and evaluation of these components; Rainbow DQN, GRU forecasting, switch migration and controller activation are each pre-existing techniques.
+
+\section{Future Work}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Testbed validation.} Run the trained policies in Mininet~\cite{lantz2010mininet} with a distributed controller platform (e.g.\ ONOS or OpenDaylight) to measure real flow-setup latency, migration overhead and controller resource use.
+  \item \textbf{Richer models.} Add queueing and processing delay and controller-specific capacities, and replace the three-level energy model with measured or empirically fitted power profiles.
+  \item \textbf{Statistical strength.} Train every configuration with ten or more seeds, store per-window results and report paired tests with confidence intervals~\cite{agarwal2021precipice}.
+  \item \textbf{Sensitivity and component ablations.} Vary the reward weights, thresholds and forecast horizons, and remove individual Rainbow components and the action mask, to measure their contribution.
+  \item \textbf{Scalable, transferable policies.} Use graph neural network state encoders and factorised (switch, target) actions so that a single policy generalises across topologies, and explore federated multi-domain training~\cite{jha2026federated}.
+  \item \textbf{Better forecasting and safety.} Use topology-aware forecasters for large networks, uncertainty-aware forecasts that the agent can weigh, and formal safety layers such as control barrier functions~\cite{dinh2025safe}.
+\end{itemize}

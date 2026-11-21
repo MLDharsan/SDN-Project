@@ -1,0 +1,25 @@
+# LaTeX build by-products (regenerated on every compile)
+latex/*.aux
+latex/*.log
+latex/*.toc
+latex/*.bbl
+latex/*.blg
+latex/*.lof
+latex/*.lot
+latex/*.loa
+latex/*.out
+latex/*.synctex.gz
+latex/*.fdb_latexmk
+latex/*.fls
+latex/figures/src/*.aux
+latex/figures/src/*.log
+
+# Duplicate of report/RESEARCH_REPORT.pdf
+latex/main.pdf
+
+# Overleaf upload package (rebuilt from latex/ sources)
+RESEARCH_REPORT_overleaf.zip
+
+# Final report outputs (kept locally, not committed)
+RESEARCH_REPORT.pdf
+markdown/

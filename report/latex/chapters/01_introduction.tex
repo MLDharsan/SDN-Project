@@ -1,0 +1,36 @@
+\chapter{Introduction}
+\label{ch:intro}
+
+\section{Background and Motivation}
+\label{sec:background}
+
+Software-Defined Networking (SDN) separates the control plane from the data plane. Forwarding devices (switches) apply flow rules, while a logically centralised controller computes those rules and exposes the network to software through open interfaces such as OpenFlow~\cite{mckeown2008openflow,kreutz2015sdn}. Centralisation simplifies management, but a single physical controller limits scalability and is a single point of failure. Production deployments therefore use a \emph{distributed} control plane in which several controllers share the switches, with each switch assigned to one controller at a time.
+
+A distributed control plane raises a second, operational question: \emph{which controllers should be active, and which switches should each one manage, as traffic changes?} The classical answer is the controller placement problem (CPP)~\cite{heller2012cpp,das2020survey}, which chooses controller locations and switch assignments at design time to minimise propagation delay, balance load or improve resilience. A placement that is good for average demand can become poor at runtime. Diurnal cycles, bursts and local hotspots can push one controller above its processing capacity while others remain lightly loaded. Overloaded controllers delay flow set-up, and controllers that remain active during low demand consume energy without doing useful work.
+
+Two runtime mechanisms address these effects. \emph{Switch migration} reassigns a switch from an overloaded controller to a less loaded one~\cite{dixit2013elasticon,yeo2021sarlb}. \emph{Controller activation management} parks (deactivates) underused controllers to save energy and evokes (reactivates) them when demand rises. Each mechanism has trade-offs. Migration improves balance but can move a switch away from its nearest controller and increase latency. Parking saves energy but removes spare capacity. Evoking restores capacity at an energy cost. Choosing among these options at every interval is a sequential, multi-objective decision problem: an action taken now changes the controller state that later decisions start from.
+
+Fixed threshold rules are simple and interpretable, but they react only after a threshold has been crossed and cannot weigh delayed consequences. Deep reinforcement learning (DRL) learns a policy from repeated interaction and optimises cumulative, not immediate, reward. It has therefore been applied to controller placement~\cite{bouzidi2022ddcp,chen2025mooo,farahi2026apdqn} and switch migration~\cite{yeo2021sarlb}. Most of this work, however, studies one mechanism in isolation. Placement methods decide where controllers should be. Migration methods move switches among an already fixed set of active controllers. Few studies let one learned policy decide jointly whether to migrate, park, evoke or wait. Fewer still examine whether a short-term \emph{traffic forecast} helps that policy act \emph{before} overload occurs.
+
+This project is motivated by three observations. First, controller management is a runtime problem and should be evaluated on temporally ordered traffic, not on independent snapshots. Second, a reactive policy can only respond to overload once it has happened, whereas a forecast of near-future load could allow capacity to be prepared in advance. Third, a credible DRL evaluation needs chronologically separated training, validation and test data, baselines evaluated under identical conditions, and honest reporting of variance across training seeds~\cite{henderson2018matters,agarwal2021precipice}.
+
+\section{Research Aim and Objectives}
+\label{sec:objectives}
+
+\paragraph{Aim.} To design, implement and evaluate a Rainbow-DQN-based framework for proactive runtime controller management in distributed SDN that jointly decides switch migration, controller parking, controller evoking and no action under dynamic traffic, balancing latency, energy and controller load.
+
+\paragraph{Objectives.}
+\begin{enumerate}[label=\textbf{O\arabic*.}, leftmargin=*]
+  \item \textbf{Environment.} Develop an SDN controller-management environment built on real network topologies and temporal switch-level traffic. In this environment a learning agent can migrate switches, park underloaded controllers, evoke parked controllers or take no action, with action validity enforced and latency, energy and load balance measured.
+  \item \textbf{Learning and fair evaluation.} Train topology-specific Rainbow DQN agents on five Internet Topology Zoo networks of increasing size. Evaluate them against threshold, random-valid and no-action baselines on chronologically held-out traffic under an identical protocol.
+  \item \textbf{Forecast-assisted proactivity.} Integrate a GRU traffic forecaster as an optional predictive observation mode. Determine whether forecasting improves controller management relative to current-state RDQN, on synthetic traffic and on an Abilene-derived real-traffic case study.
+\end{enumerate}
+
+\section{Scope}
+\label{sec:scope}
+
+The study is carried out in a simulator. Controller locations are fixed graph nodes chosen by degree and closeness centrality; the agent manages their runtime state (active or parked) and the switch-to-controller mapping, but does not move controllers. Latency is the graph-derived propagation delay along shortest paths, and energy is a controller-state model (Section~\ref{sec:energy}), not a hardware measurement. The real-traffic case study maps measured Abilene traffic dynamics onto the OS3E topology; it is not measured OS3E production traffic. Deployment on an OpenFlow testbed such as Mininet~\cite{lantz2010mininet} is outside the scope of this report and is discussed as future work.
+
+\section{Report Organisation}
+
+Chapter~\ref{ch:related} reviews and compares related work by methodological category and identifies the research gap. Chapter~\ref{ch:method} presents the system architecture, the Markov decision process, the reward, the Rainbow DQN agent and the GRU forecaster. Chapter~\ref{ch:setup} describes the datasets, implementation, experimental protocol and metrics. Chapter~\ref{ch:results} reports and discusses the results, including ablations and limitations. Chapter~\ref{ch:conclusion} concludes and outlines future work. The appendices contain the complete result tables, hyperparameters, verification tests and reproduction commands.

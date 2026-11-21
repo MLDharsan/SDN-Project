@@ -31,3 +31,9 @@ research_progress_report*
 thesis_chat_summary*
 weekly_diary*
 RESEARCH_CORE_FIXES*
+
+# Report drafts and notes (kept locally, not committed)
+FINAL_RESEARCH_PROJECT_REPORT_*
+ADVISOR_RESEARCH_AND_LITERATURE_REPORT_*
+FINAL_COMBINED_RESULTS_TABLE.md
+GRU_PREDICTIVE_IMPLEMENTATION_*.md

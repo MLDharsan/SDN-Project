@@ -1,0 +1,70 @@
+\chapter{Related Work}
+\label{ch:related}
+
+This chapter groups related studies by \emph{methodological category}, not paper by paper: design-time placement, runtime migration, learning-based placement and mapping, forecast-assisted decision-making, and safety- and scale-oriented DRL. It then sets out the deep reinforcement learning and sequence-modelling foundations the project builds on, compares the closest approaches in Table~\ref{tab:litcompare}, and states the research gap.
+
+\section{Design-Time Controller Placement}
+\label{sec:rw-cpp}
+
+Heller \emph{et al.}~\cite{heller2012cpp} formulated the controller placement problem: given a topology, choose $k$ controller locations to minimise average or worst-case switch--controller propagation latency. Later work, surveyed by Das \emph{et al.}~\cite{das2020survey}, extended the objective to capacity limits, load balance, reliability, inter-controller synchronisation and cost, solved with integer programming, clustering and metaheuristics. Two properties of this line of work are relevant here. First, it shows that the topology itself, through propagation delay, determines a latency floor that no assignment can beat. This project therefore evaluates on several real topologies (Topology Zoo~\cite{knight2011zoo}) and reports both average and worst-case latency. Second, placement is normally solved \emph{offline}, for a representative or peak demand. The resulting assignment is static, so it neither adapts when load shifts during the day nor exploits low-demand periods to save energy.
+
+\section{Runtime Load Balancing by Switch Migration}
+\label{sec:rw-migration}
+
+Runtime approaches take the controller locations as given and adapt the switch-to-controller mapping. ElastiCon~\cite{dixit2013elasticon} introduced a switch-migration protocol and an elastic controller pool that can grow or shrink with load. This establishes that both migration and controller activation are feasible operations in a distributed control plane. Most subsequent schemes, reviewed in the 2025 survey of Liu \emph{et al.}~\cite{liu2025survey}, trigger migration from static or dynamic load thresholds and select the switch and target controller with heuristics. The survey identifies dynamic traffic, migration overhead and real-time decision quality as open challenges, and classifies existing methods as passive (reacting to overload) or proactive (anticipating it).
+
+Reinforcement learning has been used to replace hand-crafted migration rules. SAR-LB~\cite{yeo2021sarlb} trains an RL agent to choose the switch and destination controller from resource-utilisation information and reports better load distribution than its compared schemes. Learned migration avoids manually tuned selection rules, but the action space contains migration only: the number of active controllers is fixed, so the policy cannot trade energy against capacity.
+
+\section{Learning-Based Placement and Mapping}
+\label{sec:rw-drl-cpp}
+
+A parallel body of work applies DRL to placement and switch--controller mapping. Bouzidi \emph{et al.}~\cite{bouzidi2022ddcp} use a Deep Q-Network heuristic (DDCP) that jointly determines the number of controllers, their locations and the switch clusters, and validate it on the ONOS controller. Farahi \emph{et al.}~\cite{farahi2026apdqn} propose AP-DQN, a recent DQN-based approach to SDN controller placement. The work closest to this project algorithmically is MOOO-RDQN by Chen \emph{et al.}~\cite{chen2025mooo}. It applies a Rainbow-style DQN, with double Q-learning, prioritised replay, dueling networks, multi-step returns, noisy networks and distributional learning, to multi-objective controller placement and switch mapping, and adds a traffic-monitoring component for overload detection. MOOO-RDQN shows that Rainbow's sample-efficiency improvements carry over to SDN control problems with large discrete action spaces. Its decision, however, is \emph{where to place controllers and how to map switches}, not \emph{when to park, evoke or migrate} during operation.
+
+\section{Forecast-Assisted Decision-Making}
+\label{sec:rw-forecast}
+
+A forecast lets a controller act on expected rather than observed load. Li \emph{et al.}~\cite{li2024mec} combine a CNN-LSTM traffic predictor with DRL for controller placement and edge selection in SDN-based multi-access edge computing, and report lower delay and energy than their baselines. The study supports the broader idea that predicted load improves DRL decisions. Its setting, though, is MEC task placement and edge selection, not runtime activation of SDN controllers, and it does not isolate the forecast's contribution by comparing the same agent with and without prediction. Recurrent networks are the usual forecasting tool for such traffic series. The gated recurrent unit (GRU)~\cite{cho2014gru} matches the long short-term memory network (LSTM)~\cite{hochreiter1997lstm} on many sequence tasks with fewer parameters~\cite{chung2014gru}, which makes it a reasonable lightweight forecaster for per-switch load.
+
+\section{Safety and Scalability of DRL Load Balancing}
+\label{sec:rw-safety}
+
+Two recent directions address weaknesses of DRL controllers. Dinh \emph{et al.}~\cite{dinh2025safe} add a control-barrier-function layer to a DRL load balancer, so that actions taken during exploration and deployment satisfy safety constraints. Jha \emph{et al.}~\cite{jha2026federated} use asynchronous federated reinforcement learning across hierarchical controllers to scale load balancing to multi-domain networks. Both indicate where a single-agent simulator such as the one in this project is limited. Here, safety is enforced by an action mask and feasibility checks, which is weaker than a formal guarantee, and a separate agent is trained for each topology.
+
+\section{Deep Reinforcement Learning Foundations}
+\label{sec:rw-drl}
+
+Deep Q-Networks~\cite{mnih2015dqn} approximate the action-value function with a neural network trained from a replay memory against a periodically updated target network. Rainbow~\cite{hessel2018rainbow} combines six extensions: double Q-learning, which reduces over-estimation~\cite{vanhasselt2016double}; prioritised experience replay~\cite{schaul2016per}; the dueling value/advantage architecture~\cite{wang2016dueling}; multi-step returns~\cite{sutton2018rl}; noisy linear layers for exploration~\cite{fortunato2018noisy}; and categorical distributional RL (C51)~\cite{bellemare2017c51}. Together these outperform each component alone. Large discrete action spaces in which many actions are illegal in a given state are commonly handled by \emph{invalid-action masking}~\cite{huang2022masking}, which this project adopts. Finally, DRL results are sensitive to random seeds and evaluation choices~\cite{henderson2018matters,agarwal2021precipice}. This motivates the multi-seed replication and the explicit uncertainty reporting used in Chapter~\ref{ch:results}.
+
+\section{Comparative Synthesis and Research Gap}
+\label{sec:gap}
+
+\begin{table}[htbp]
+\centering
+\caption{Methodological comparison of the closest related approaches with this work.}
+\label{tab:litcompare}
+\small
+\begin{tabularx}{\textwidth}{@{}P{2.55cm}P{2.25cm}P{1.85cm}LL@{}}
+\toprule
+\textbf{Work} & \textbf{Decision} & \textbf{Method} & \textbf{Proactivity / energy} & \textbf{Gap relative to this work} \\
+\midrule
+Heller \emph{et al.}~\cite{heller2012cpp}; Das \emph{et al.}~\cite{das2020survey} & Placement (offline) & Optimisa\-tion, heuristics & None; static design & No runtime adaptation \\
+ElastiCon~\cite{dixit2013elasticon} & Migration, pool resizing & Protocol + heuristic & Reactive & Rule-based; no learning \\
+SAR-LB~\cite{yeo2021sarlb} & Switch migration & RL & Reactive; no energy term & No park/evoke actions \\
+DDCP~\cite{bouzidi2022ddcp}; AP-DQN~\cite{farahi2026apdqn} & Placement, clustering & DQN & Placement-level & Not runtime park/evoke/migrate \\
+MOOO-RDQN~\cite{chen2025mooo} & Placement and mapping & Rainbow DQN & Monitoring for overload detection & Placement problem; no forecast ablation \\
+Li \emph{et al.}~\cite{li2024mec} & Placement, edge selection (MEC) & DRL + CNN-LSTM & Forecast-assisted & MEC setting; no with/without-forecast comparison \\
+Dinh \emph{et al.}~\cite{dinh2025safe} & Load balancing & DRL + barrier function & Safety layer & No controller activation \\
+\textbf{This work} & \textbf{Migrate, park, evoke, no-op} & \textbf{Rainbow DQN, action mask} & \textbf{Optional GRU forecast; energy in reward} & Simulator; modelled energy; per-topology agents \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Table~\ref{tab:litcompare} shows how these categories relate. Placement studies optimise an initial configuration. Migration studies rebalance a fixed set of active controllers. Learning-based placement brings DRL to the design-time decision. Forecast-assisted work shows that predicted load can guide decisions, but in neighbouring problems. Safety and federated studies harden DRL controllers but do not change what they decide. Across the literature, three points recur:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Mechanisms are studied separately.} Migration (which mainly affects balance and latency) and controller activation (which mainly affects energy and capacity) are rarely chosen by the same learned policy, even though they act on the same controllers and interact.
+  \item \textbf{The contribution of forecasting is rarely isolated.} Where forecasting is used, it is seldom compared against an otherwise identical current-state agent, so it is unclear when prediction actually helps.
+  \item \textbf{Evaluation protocols are often weak.} Temporal leakage between training and test traffic, single-seed results and baselines evaluated under different conditions make reported gains hard to interpret.
+\end{enumerate}
+
+\paragraph{Research gap.} This project addresses a runtime controller-management framework in which \emph{one} learned discrete policy chooses among switch migration, controller parking, controller evoking and no action under temporally varying traffic, with explicit latency, energy and balance objectives. The policy is evaluated with chronological splits and identical baselines across topologies of different scale, and a matched current-state versus GRU-forecast comparison measures whether proactivity adds value. The aim is not to outperform placement methods on their own problem. Published percentage improvements from those studies use different problems, traffic and metrics, so they are compared methodologically (Section~\ref{sec:compare-existing}) rather than numerically.

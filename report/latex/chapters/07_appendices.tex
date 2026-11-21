@@ -1,0 +1,164 @@
+\chapter{Complete Result Tables}
+\label{app:tables}
+
+The tables below are generated automatically from the frozen evaluation CSV files by \path{report/scripts/make_appendix_tables.py}. Each row is the mean over six evaluation episodes of 500 steps; ``s.d.'' is the standard deviation of episode reward \emph{across the six windows}, which mainly reflects differences in traffic intensity between windows. Park, Evoke and Mig are successful actions per episode, Fail is failed actions per episode, and Over\%/Under\% are the shares of steps with at least one overloaded/underloaded controller before acting. Validation runs use evaluation seed 1042 and final tests use seed 2042.
+
+\input{chapters/07a_generated_tables}
+
+\chapter{Configuration Details}
+\label{app:config}
+
+\section{Synthetic traffic generator}
+
+\begin{table}[H]
+\centering
+\caption{Per-topology parameters of the synthetic traffic generator (20,000 steps each; seed $42+N$).}
+\label{tab:app-gen}
+\small
+\fitwidth{\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+\textbf{Topology} & \textbf{Base} & \textbf{Burst prob.} & \textbf{Burst mult.} & \textbf{Hotspot frac.} & \textbf{Noise $\sigma$} & \textbf{Memory} & \textbf{Event int.}\\
+\midrule
+Gridnet    & 0.85 & 0.030 & 1.20--1.45 & 0.22 & 0.10 & 0.82 & 420\\
+BellCanada & 0.95 & 0.045 & 1.25--1.60 & 0.18 & 0.12 & 0.85 & 300\\
+OS3E       & 1.00 & 0.055 & 1.25--1.70 & 0.20 & 0.14 & 0.84 & 260\\
+Interoute  & 1.08 & 0.065 & 1.30--1.80 & 0.14 & 0.16 & 0.86 & 220\\
+Cogentco   & 1.12 & 0.080 & 1.35--1.95 & 0.12 & 0.18 & 0.88 & 180\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\section{Fixed settings}
+
+\begin{table}[H]
+\centering
+\caption{Settings shared by all experiments.}
+\label{tab:app-fixed}
+\small
+\begin{tabularx}{\textwidth}{@{}p{5.2cm}L@{}}
+\toprule
+\textbf{Setting} & \textbf{Value}\\
+\midrule
+Controllers & 1 master + 3 initially active + 2 initially parked slaves\\
+Thresholds & underload $<0.30$, overload $>0.70$ (mean assigned switch load)\\
+Energy model & master 50\,W, active slave 100\,W, parked slave 10\,W\\
+Reward & weights 0.35 / 0.35 / 0.30; shaping as in Table~\ref{tab:shaping}; oscillation window 5 steps; clip $[-2,1]$\\
+Rainbow common & $\gamma=0.99$; C51 51 atoms on $[-10,10]$; noisy $\sigma_0=0.5$; PER $\alpha=0.6$, $\beta$ 0.4$\rightarrow$1; Adam; grad.\ clip 10\\
+Training schedule & 1,000 warm-up steps; update every 4 steps; target copy every 1,000 steps; $\varepsilon$ 0.10$\rightarrow$0.01\\
+Training episodes & 1,000 steps; start index advances by 1,000 per episode\\
+GRU & history 12; horizon 5 (3 in ablation); 2 layers $\times$ 64; dropout 0.1; Adam $10^{-3}$; batch 128; $\le$50 epochs; patience 8\\
+Evaluation & 6 episodes $\times$ 500 steps, evenly spaced windows; seeds 1042 (validation), 2042 (test)\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\chapter{Implementation Verification}
+\label{app:verification}
+
+\section{Defects found and corrected before the final experiments}
+
+A systematic audit (June 2026) of the first working version identified the defects below. All were corrected, previous results were archived and labelled as pre-fix diagnostics, and every model reported in this document was retrained afterwards.
+
+\begin{enumerate}[leftmargin=*]
+  \item Traffic advanced only once every 50 environment steps, with a separate manual update every 100 steps during training, so a 500-step evaluation saw only the low-load start of a trace.
+  \item Every evaluation episode started at the beginning of the trace, which made the reported 100\% underload and 0\% overload artefacts of sampling.
+  \item Training, single-model testing and fair evaluation used three different environment and reward implementations.
+  \item Reward bonuses and penalties reached about $+200$/$-260$, far outside the C51 support of $[-10,10]$.
+  \item The C51 projection lost probability mass when a projected value fell exactly on an atom.
+  \item Partial $n$-step transitions were not flushed at episode termination.
+  \item Park and evoke action indices depended on controller state, so one index could change meaning over time.
+  \item Actions marked valid could still fail their feasibility checks.
+  \item Migration load calculations did not consistently use the actual switch traffic.
+  \item The reported load-balance field did not match the standard switch-count definition.
+  \item Legacy baseline scripts imported a missing environment and used an obsolete action encoding.
+  \item Existing checkpoints used an old action dimension that could not represent the corrected action space.
+\end{enumerate}
+
+\section{Regression tests}
+
+\begin{table}[H]
+\centering
+\caption{Unit tests in \texttt{tests/test\_sdn\_core.py} (all eight pass on the final code).}
+\label{tab:app-tests}
+\small
+\begin{tabularx}{\textwidth}{@{}P{7.2cm}L@{}}
+\toprule
+\textbf{Test} & \textbf{Invariant checked}\\
+\midrule
+\path{test_trace_advances_once_per_step} & One trace row is consumed per environment step\\
+\path{test_action_slots_are_stable_and_threshold_policy_is_valid} & Baseline actions are in the valid set and slots map to stable meanings\\
+\path{test_reward_is_inside_declared_range} & Reward lies in $[-2,1]$\\
+\path{test_predictive_mode_expands_state_...} & Predictive state adds $N+K$ elements; current mode unchanged\\
+\path{test_forecasted_overload_allows_early_evoke} & A forecast overload enables a successful evoke before current overload\\
+\path{test_temporal_split_preserves_order_...} & Chronological split boundaries and order\\
+\path{test_c51_projection_preserves_probability_mass...} & Projected distribution sums to one on exact atoms\\
+\path{test_terminal_transition_flushes_n_step_prefixes} & All $n$-step prefixes are stored at episode end\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Note on figure regeneration}
+
+All figures in this report were regenerated from the frozen CSV files by \path{report/scripts/make_report_figures.py}, which selects each row by \emph{(topology, policy)}. The earlier project script \path{experiments/plot_final_results.py} selects rows by policy only. When it reads the multi-topology CSV, it therefore plots Gridnet's values for BellCanada and Interoute in the synthetic figures under \path{results/final_figures/synthetic/}. Those older synthetic figures should not be used. The real-case-study figures and the three-seed aggregate CSV are unaffected, because each of their source files contains a single topology. No result values or tables are affected; only those plots are.
+
+\chapter{Reproducibility}
+\label{app:repro}
+
+All commands are run from the project root after \path{source venv/bin/activate}. Seeds, data paths and output folders match those used for the reported results.
+
+\begin{lstlisting}[language=bash]
+# 0. Regression tests
+python -m unittest tests.test_sdn_core -v
+
+# 1. Synthetic traffic and chronological splits
+python experiments/preprocessing/create_synthetic_traffic.py
+for t in gridnet bellcanada os3e interoute cogentco; do
+  python experiments/preprocessing/split_traffic_temporal.py --topology $t
+done
+
+# 2. GRU forecasters (train/validation only)
+python experiments/train_gru_forecaster.py --topology os3e \
+  --history-length 12 --forecast-horizon 5 --hidden-dim 64 \
+  --num-layers 2 --epochs 50 --patience 8 --seed 42
+
+# 3. Rainbow DQN (current and predictive)
+python experiments/train_rainbow_fixed_rewards.py --topology os3e \
+  --timesteps 80000 --seed 42 --observation-mode current \
+  --traffic data/traffic/processed/os3e/splits/os3e_train.npy \
+  --output-dir models/current_split
+python experiments/train_rainbow_fixed_rewards.py --topology os3e \
+  --timesteps 80000 --seed 42 --observation-mode predictive \
+  --traffic data/traffic/processed/os3e/splits/os3e_train.npy
+
+# 4. Validation (seed 1042) and one-time final test (seed 2042)
+python experiments/evaluate_fair_baselines.py --topologies all \
+  --policies all --observation-mode current --traffic-split test \
+  --model-dir models/current_split --episodes 6 \
+  --steps-per-episode 500 --seed 2042 \
+  --output-dir results/final_test/current_selected
+
+# 5. Abilene-derived real-traffic case study
+python experiments/preprocessing/prepare_abilene_os3e_real_training.py
+python experiments/evaluate_real_traffic_zero_shot.py \
+  --traffic data/traffic/real_case_study/os3e/splits/os3e_test.npy \
+  --model models/predictive/LATEST_gru_rainbow_proactive_os3e.pth \
+  --gru-model models/forecasting/LATEST_gru_os3e.pth \
+  --observation-mode predictive --episodes 6 \
+  --steps-per-episode 500 --seed 2042
+
+# 6. Report figures and appendix tables (read-only on results)
+python report/scripts/make_report_figures.py
+python report/scripts/make_appendix_tables.py
+\end{lstlisting}
+
+\paragraph{Primary result files.}
+\begingroup\raggedright
+\begin{itemize}[leftmargin=*]
+  \item \path{results/final_test/current_selected/fair_eval_20260829_141042.csv}
+  \item \path{results/final_test/current_cogentco_120k/fair_eval_20260829_095206.csv}
+  \item \path{results/final_test/predictive_os3e/fair_eval_20260829_142424.csv}
+  \item \path{results/real_case_study/zero_shot_os3e_current/fair_eval_20261107_111507.csv}
+  \item \path{results/real_case_study/zero_shot_os3e/fair_eval_20261028_212001.csv}
+  \item \path{results/real_case_study/{final,replications/seed_4*/final\}\_\{current,predictive\}/}
+\end{itemize}
+\par\endgroup

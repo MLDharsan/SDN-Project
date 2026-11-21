@@ -1,0 +1,59 @@
+% ---------------------------------------------------------------- title page
+\begin{titlepage}
+  \centering
+  \vspace*{0.4cm}
+  {\large\textsc{\university}\par}
+  \vspace{2pt}
+  {\normalsize \faculty\ \textbullet\ \department\par}
+  \vspace{1.6cm}
+  {\LARGE\bfseries \reporttitle\par}
+  \vspace{1.4cm}
+  {\large Final-Year Research Project Report\par}
+  \vspace{4pt}
+  {\normalsize \coursecode\par}
+  \vfill
+  \begin{tabular}{rl}
+    \textbf{Student:} & \studentname \\
+    \textbf{Registration number:} & \regno \\[4pt]
+    \textbf{Supervisor:} & \supervisor \\
+  \end{tabular}
+  \vfill
+  {\normalsize A report submitted in partial fulfilment of the requirements of the\\
+  Bachelor of Science (Honours) degree in Computer Science\par}
+  \vspace{1cm}
+  {\large \submissiondate\par}
+\end{titlepage}
+
+% ---------------------------------------------------------------- declaration
+\chapter*{Declaration}
+\addcontentsline{toc}{chapter}{Declaration}
+I hereby declare that this research project report, entitled \emph{``\reporttitle''}, is my own work and has not been submitted, in whole or in part, for any other degree or qualification. Work by other authors is acknowledged in the text and listed in the references. The implementation, experiments and results reported here were carried out by me under the supervision of \supervisor.
+
+\vspace{2cm}
+\noindent
+\begin{tabular}{@{}p{0.45\textwidth}p{0.45\textwidth}@{}}
+\rule{5.5cm}{0.4pt} & \rule{5.5cm}{0.4pt}\\
+\studentname\ (\regno) & Date\\[1.6cm]
+\end{tabular}
+
+\noindent I certify that the above statement is correct to the best of my knowledge, and that the report is suitable for submission.
+
+\vspace{2cm}
+\noindent
+\begin{tabular}{@{}p{0.45\textwidth}p{0.45\textwidth}@{}}
+\rule{5.5cm}{0.4pt} & \rule{5.5cm}{0.4pt}\\
+\supervisor\ (Supervisor) & Date\\
+\end{tabular}
+
+% ---------------------------------------------------------------- acknowledgements
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+I am grateful to my supervisor, \supervisor, for guidance and constructive feedback throughout this project. I thank the academic and technical staff of the \department, \university, for their support and for the facilities provided. I also acknowledge the creators of the Internet Topology Zoo and of the Abilene traffic-matrix archive, whose publicly available data made this study possible. Finally, I thank my family and friends for their encouragement.
+
+% ---------------------------------------------------------------- abstract
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\input{chapters/00_abstract_body}
+
+\vspace{6pt}
+\noindent\textbf{Keywords:} software-defined networking; controller management; switch migration; energy efficiency; deep reinforcement learning; Rainbow DQN; GRU traffic forecasting.
