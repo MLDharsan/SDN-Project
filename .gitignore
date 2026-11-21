@@ -37,3 +37,7 @@ FINAL_RESEARCH_PROJECT_REPORT_*
 ADVISOR_RESEARCH_AND_LITERATURE_REPORT_*
 FINAL_COMBINED_RESULTS_TABLE.md
 GRU_PREDICTIVE_IMPLEMENTATION_*.md
+
+# Mininet backend: run outputs and local symlink
+mininet_results/
+mininet_integration/_vendor/

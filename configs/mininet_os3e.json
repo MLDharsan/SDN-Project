@@ -1,0 +1,63 @@
+{
+  "topology": "os3e",
+  "num_slave_controllers": 3,
+  "num_parked_controllers": 2,
+  "default_profile": "synthetic",
+  "profiles": {
+    "synthetic": {
+      "description": "Synthetic OS3E held-out test split (Table A of the final results).",
+      "traffic_path": "data/traffic/processed/os3e/splits/os3e_test.npy",
+      "current_model": "models/current_split/LATEST_rainbow_proactive_os3e.pth",
+      "predictive_model": "models/predictive/LATEST_gru_rainbow_proactive_os3e.pth",
+      "gru_model": "models/forecasting/LATEST_gru_os3e.pth"
+    },
+    "real_case_study": {
+      "description": "Abilene-derived OS3E real-data-trained case study, seed 42 (Table C).",
+      "traffic_path": "data/traffic/real_case_study/os3e_real_trained_v1/splits/os3e_test.npy",
+      "current_model": "models/real_case_study/current/LATEST_rainbow_proactive_os3e.pth",
+      "predictive_model": "models/real_case_study/predictive/LATEST_gru_rainbow_proactive_os3e.pth",
+      "gru_model": "models/real_case_study/forecasting/LATEST_gru_os3e.pth"
+    }
+  },
+  "network": {
+    "link_bw_mbps": 100,
+    "host_link_bw_mbps": null,
+    "use_link_delay": true,
+    "delay_scale": 1.0,
+    "max_queue_size": 1000,
+    "fail_mode": "secure",
+    "pingall_on_start": true
+  },
+  "traffic": {
+    "max_rate_mbps": 20.0,
+    "min_rate_mbps": 0.05,
+    "udp_payload_bytes": 1200,
+    "wire_overhead_bytes": 42,
+    "pairing_offset": 17,
+    "iperf3_port": 5201
+  },
+  "timing": {
+    "interval_s": 5,
+    "measure_warmup_s": 1.0,
+    "measure_margin_s": 0.3,
+    "settle_after_start_s": 2.0
+  },
+  "controllers": {
+    "listen_host": "127.0.0.1",
+    "base_port": 6653,
+    "park_mode": "stop",
+    "startup_timeout_s": 20.0,
+    "handover_timeout_s": 10.0
+  },
+  "probes": {
+    "ping_pairs": 4,
+    "ping_count": 3
+  },
+  "run": {
+    "steps": 120,
+    "start_index": 0,
+    "seed": 1042,
+    "policies": ["rdqn", "threshold", "random_valid", "noop"],
+    "observation_mode": "current"
+  }
+}
