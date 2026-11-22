@@ -108,9 +108,11 @@ def preprocess(text: str, cites: dict, labels: dict) -> str:
 
     def tabularx(m: re.Match) -> str:
         spec = re.sub(r"\{[^}]*\}|@|>|<", "", m.group(1))
-        cols = sum(spec.count(ch) for ch in "pLXClrc")
+        cols = sum(spec.count(ch) for ch in "pPLXClrc")
         return "\\begin{tabular}{" + "l" * cols + "}"
 
+    text = re.sub(r"(\\begin\{tabularx?\}(?:\{\\textwidth\})?)\{((?:[^{}]|\{[^{}]*\})*)\}",
+                  lambda m: m.group(1) + "{" + m.group(2).replace("P{", "p{") + "}", text)
     text = re.sub(r"\\begin\{tabularx\}\{\\textwidth\}\{((?:[^{}]|\{[^{}]*\})*)\}", tabularx, text)
     text = text.replace("\\end{tabularx}", "\\end{tabular}")
     return text
@@ -217,9 +219,12 @@ def main() -> None:
 
     appendix = (TEX / "chapters" / f"{APPENDIX}.tex").read_text()
     appendix = appendix.replace("\\input{chapters/07a_generated_tables}", "GENERATEDTABLESPLACEHOLDER")
+    appendix = appendix.replace("\\input{chapters/07b_mininet_tables}", "MININETTABLESPLACEHOLDER")
     md = pandoc(preprocess(appendix, cites, LABELS))
     md = md.replace("GENERATEDTABLESPLACEHOLDER",
                     (ROOT / "report" / "markdown" / "appendix_tables.md").read_text())
+    md = md.replace("MININETTABLESPLACEHOLDER",
+                    (ROOT / "report" / "markdown" / "appendix_mininet_tables.md").read_text())
     letters = iter("ABCDEFG")
     md = re.sub(r"(?m)^## (.+)$", lambda m: f"## Appendix {next(letters)}: {m.group(1)}", md)
     parts.append(md)

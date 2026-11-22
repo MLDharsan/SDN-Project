@@ -2,7 +2,7 @@
 
 | File | What it is |
 |---|---|
-| `RESEARCH_REPORT.pdf` | Final report (64 pages, A4, IEEE references) — print this |
+| `RESEARCH_REPORT.pdf` | Final report (77 pages, A4, IEEE references; includes the E4 Mininet emulation validation) — print this |
 | `RESEARCH_REPORT_overleaf.zip` | Overleaf project: *New Project → Upload Project*, compiler **pdfLaTeX**, main file `main.tex` |
 | `markdown/RESEARCH_REPORT.md` | Markdown edition (same numbering as the PDF; images from `latex/figures/`) |
 | `latex/` | LaTeX sources: `main.tex`, `chapters/`, `references.bib`, `figures/` (TikZ sources in `figures/src/`) |
@@ -15,11 +15,14 @@ Edit names, dates and supervisor in the metadata block at the top of `latex/main
 ```bash
 venv/bin/python report/scripts/make_report_figures.py    # figures from frozen CSVs / logs / checkpoints
 venv/bin/python report/scripts/make_appendix_tables.py   # Appendix A tables
+venv/bin/python report/scripts/make_mininet_results.py   # E4 figure + Appendix D table (reads mininet_results/)
 cd report/latex && pdflatex main && bibtex main && pdflatex main && pdflatex main && cd -
 venv/bin/python report/scripts/build_markdown.py         # needs the LaTeX build (main.aux / main.bbl)
 ```
 
-The scripts only read from `results/`, `models/`, `logs/` and `data/`; they write only inside `report/`.
+The scripts only read from `results/`, `models/`, `logs/`, `data/` and `mininet_results/`; they write only inside `report/`.
+The E4 diagram is TikZ: `cd report/latex/figures/src && pdflatex mininet_architecture.tex`, then move the PDF to `figures/` and
+make the PNG with `pdftoppm -png -r 200 -singlefile mininet_architecture.pdf mininet_architecture`.
 
 ## Note on the older figures
 

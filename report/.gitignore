@@ -23,3 +23,9 @@ RESEARCH_REPORT_overleaf.zip
 # Final report outputs (kept locally, not committed)
 RESEARCH_REPORT.pdf
 markdown/
+
+# Presentation outputs (rebuilt by presentation/build_presentation.js; kept locally)
+presentation/FINAL_PRESENTATION.pptx
+presentation/SPEAKER_SCRIPT.md
+presentation/VIVA_GUIDE.md
+presentation/.~lock.*

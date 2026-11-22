@@ -14,6 +14,8 @@ Figure~\ref{fig:architecture} shows the architecture. It has four parts.
   \item An optional \textbf{GRU forecaster} predicts near-future switch loads. In \emph{predictive mode} the forecasts are appended to the state and used to anticipate overload.
 \end{enumerate}
 
+The same environment code is reused unchanged by the Mininet emulation backend (Section~\ref{sec:mininet-setup}), where it is fed measured instead of trace loads and its decisions are carried out on emulated switches and controller processes.
+
 At each decision interval $t$ the workflow is: (i) observe the state $s_t$; (ii) compute the valid action set $\mathcal{V}(s_t)$; (iii) select $a_t\in\mathcal{V}(s_t)$; (iv) execute $a_t$ and compute the reward $r_t$ from the resulting configuration; (v) advance the traffic trace by one row, recompute controller loads and, in predictive mode, refresh the forecast to produce $s_{t+1}$; and (vi) during training, store the transition and update the network.
 
 \begin{figure}[htbp]

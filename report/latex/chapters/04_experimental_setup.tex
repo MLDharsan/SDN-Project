@@ -68,7 +68,7 @@ The real trace is markedly less stressed than the synthetic one. In the training
 \section{Implementation Details}
 \label{sec:impl}
 
-The framework was implemented in Python 3.10.14. Table~\ref{tab:software} lists the main libraries and Table~\ref{tab:modules} the modules. All training and evaluation ran on a CPU-only laptop (Intel Core~5~120U, 12 logical cores, 16\,GB RAM, Ubuntu 24.04); no GPU was used. Each run writes its checkpoint together with a JSON metadata file recording the state and action dimensions, hyperparameters, seed, traffic file, reward version (\path{normalized_multi_objective_v2}) and action-schema version (\path{stable_controller_slots_v2}). An evaluation refuses to load a checkpoint whose dimensions do not match the environment. Training was logged to TensorBoard, and evaluation results were written as CSV and JSON. A suite of eight unit tests (Appendix~\ref{app:verification}) checks the invariants that earlier bugs had violated, and all eight pass on the final code.
+The framework was implemented in Python 3.10.14. Table~\ref{tab:software} lists the main libraries and Table~\ref{tab:modules} the modules. All training and evaluation ran on a CPU-only laptop (Intel Core~5~120U, 12 logical cores, 16\,GB RAM, Ubuntu 24.04); no GPU was used. Each run writes its checkpoint together with a JSON metadata file recording the state and action dimensions, hyperparameters, seed, traffic file, reward version (\path{normalized_multi_objective_v2}) and action-schema version (\path{stable_controller_slots_v2}). An evaluation refuses to load a checkpoint whose dimensions do not match the environment. Training was logged to TensorBoard, and evaluation results were written as CSV and JSON. A suite of eight unit tests (Appendix~\ref{app:verification}) checks the invariants that earlier bugs had violated, and all eight pass on the final code. The emulation backend of Section~\ref{sec:mininet-setup} is a separate package (\path{mininet_integration/}) that imports the environment and the trained models without modifying them.
 
 \begin{table}[htbp]
 \centering
@@ -85,6 +85,11 @@ Gymnasium~\cite{towers2024gymnasium} & 1.2.3 -- environment interface\\
 NetworkX~\cite{hagberg2008networkx} & 3.4.2 -- topology parsing, shortest paths, centrality\\
 NumPy & 2.2.6 -- traffic generation and preprocessing\\
 TensorBoard / Matplotlib & 2.20.0 / 3.10.8 -- logging and figures\\
+\midrule
+Mininet~\cite{lantz2010mininet} & 2.3.0 -- emulated hosts, switches and shaped links (E4)\\
+Open vSwitch~\cite{pfaff2015ovs} & 3.3.9 -- OpenFlow 1.3 software switches (E4)\\
+os-ken~\cite{osken2024} & 3.1.1 -- OpenFlow controller framework, a Ryu fork (E4)\\
+iperf3~\cite{esnet2024iperf3} & 3.16 -- UDP traffic replay, loss and jitter (E4)\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -110,6 +115,12 @@ TensorBoard / Matplotlib & 2.20.0 / 3.10.8 -- logging and figures\\
 \path{experiments/evaluate_fair_baselines.py} & Identical-condition evaluation of RDQN and baselines\\
 \path{experiments/evaluate_real_traffic_zero_shot.py} & Evaluation on an explicitly supplied real-derived trace\\
 \path{tests/test_sdn_core.py} & Regression tests of environment and Rainbow invariants\\
+\midrule
+\path{mininet_integration/topology_zoo_mininet.py} & OS3E Mininet network from the same topology loader; loop-free routes\\
+\path{mininet_integration/osken_apps/proactive_routing_app.py} & os-ken controller application: proactive routes, handover events\\
+\path{mininet_integration/traffic_replay.py}, \path{telemetry.py} & Trace replay with iperf3; measured loads from switch counters\\
+\path{mininet_integration/policy_adapter.py}, \path{action_executor.py} & Shadow environment, policy call, execution of decisions on OVS\\
+\path{mininet_integration/run_mininet_experiment.py} & E4 experiment driver and simulator reference run\\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -158,20 +169,102 @@ The configurations were then frozen and each test split was evaluated once. The 
 
 \begin{table}[htbp]
 \centering
-\caption{Summary of the three experimental protocols.}
+\caption{Summary of the four experimental protocols.}
 \label{tab:protocols}
 \small
-\begin{tabularx}{\textwidth}{@{}p{3.0cm}LLL@{}}
+\begin{tabularx}{\textwidth}{@{}p{2.3cm}LLLL@{}}
 \toprule
- & \textbf{Synthetic (E1)} & \textbf{Zero-shot real (E2)} & \textbf{Real-data-trained (E3)}\\
+ & \textbf{Synthetic (E1)} & \textbf{Zero-shot real (E2)} & \textbf{Real-data-trained (E3)} & \textbf{Mininet emulation (E4)}\\
 \midrule
-Topologies & All five & OS3E & OS3E\\
-Training traffic & Synthetic train split & Synthetic (no retraining) & Abilene \texttt{X06}--\texttt{X14}\\
-Selection traffic & Synthetic validation split & -- & Abilene \texttt{X15}--\texttt{X17}\\
-Test traffic & Synthetic test split & Abilene \texttt{X06}--\texttt{X20} test 15\% & Abilene \texttt{X21}--\texttt{X24}\\
-Modes & Selected per topology & Current and predictive & Current and predictive\\
-Training seeds & 42 & 42 & 42, 43, 44\\
-Evaluation & $6\times500$, seed 2042 & $6\times500$, seed 2042 & $6\times500$, seed 2042\\
+Topologies & All five & OS3E & OS3E & OS3E\\
+Training traffic & Synthetic train split & Synthetic (no retraining) & Abilene \texttt{X06}--\texttt{X14} & None (E1 and E3 models reused)\\
+Selection traffic & Synthetic validation split & -- & Abilene \texttt{X15}--\texttt{X17} & --\\
+Test traffic & Synthetic test split & Abilene \texttt{X06}--\texttt{X20} test 15\% & Abilene \texttt{X21}--\texttt{X24} & Windows of the E1 and E3 test traces\\
+Modes & Selected per topology & Current and predictive & Current and predictive & Current and predictive\\
+Training seeds & 42 & 42 & 42, 43, 44 & 42\\
+Evaluation & $6\times500$, seed 2042 & $6\times500$, seed 2042 & $6\times500$, seed 2042 & $3\times150$ per mode, seed 1042\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Emulation Validation Setup (E4)}
+\label{sec:mininet-setup}
+
+Experiments E1--E3 take place entirely inside the simulator: loads are read directly from the trace and actions only change variables. E4 asks whether the same trained policies still work when (i) the loads they observe are \emph{measured} on a network carrying real packets and (ii) every decision must be \emph{carried out} on real OpenFlow switches and controller processes. The models, environment code and selection functions are reused without modification, and E4 involves no training.
+
+\subsection{Emulated network}
+
+Figure~\ref{fig:mininet-arch} shows the emulation backend. Its three parts run on the laptop used for training (Section~\ref{sec:impl}).
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Data plane.} Mininet~\cite{lantz2010mininet} builds the OS3E network from the same \path{TopologyLoader} as the simulator, so switch $i$ in Mininet is switch $i$ in the agent's state. Each of the 34 switches is an Open vSwitch~\cite{pfaff2015ovs} bridge running OpenFlow 1.3~\cite{onf2012of13} in fail-secure mode, with one host attached. Each of the 36 links is limited to 100\,Mb/s and given its geographic propagation delay from Section~\ref{sec:system-model}. The OS3E GML file contains two disconnected components (28 and 6 switches); Mininet reproduces this, and traffic and routes stay inside each component.
+  \item \textbf{Control plane.} Each slave controller $c_1$--$c_5$ is a separate os-ken~\cite{osken2024} process listening on its own TCP port. When a switch connects, the controller installs proactive shortest-path (by delay) forwarding rules for every reachable destination and confirms them with an OpenFlow barrier. Packets that match no rule are dropped, so the cyclic topology never floods. Parking a controller stops its process, and evoking one starts it.
+  \item \textbf{Orchestrator.} The master controller $c_0$ is a Python process that replays traffic, measures loads, runs the policy and carries out its decisions.
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.95\textwidth]{mininet_architecture}
+  \caption{E4 emulation backend. The orchestrator replays one trace row per interval, measures the resulting switch loads, lets the unchanged environment and policy decide, and carries out the decision on the Mininet network and the os-ken controller processes.}
+  \label{fig:mininet-arch}
+\end{figure}
+
+\subsection{Decision loop}
+
+Each decision interval lasts 5\,s and has five steps.
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Replay.} For trace row $\mathbf{x}_t$, host $h_i$ sends UDP traffic with iperf3~\cite{esnet2024iperf3} at $20\,x_{i,t}$\,Mb/s (1,200-byte payloads) to a fixed partner host in its component. Ping probes between four host pairs run at the same time to measure round-trip time (RTT).
+  \item \textbf{Measurement.} The bytes received on each switch's host port are read once from the kernel's interface counters. After header overhead is removed, they are divided by 20\,Mb/s, which gives a \emph{measured} load $\tilde{x}_{i,t}\in[0,1]$ on the same scale as the trace.
+  \item \textbf{Decision.} The measured loads are passed to a \emph{shadow} copy of the unchanged simulator environment. It computes the controller loads, the 46- or 86-element state (with the GRU forecast in predictive mode), the valid-action mask and the reward exactly as in training. The policy then selects an action using the same functions as the fair evaluator of E1--E3.
+  \item \textbf{Execution.} The orchestrator compares the shadow's new switch-to-controller mapping with the previous one and applies the difference in a safe order. First it starts any evoked controller and waits until it is listening. Next, for each switch that changes controller, it issues \texttt{ovs-vsctl set-controller} and waits for the new controller to report the connection and confirm the flow rules; this interval is the measured \emph{handover time}. Finally it stops any parked controller, which is refused if the controller still owns a switch.
+  \item \textbf{Verification.} The actual mapping is read back from the switch database (OVSDB) and compared with the shadow's mapping. A step is \emph{inconsistent} if they differ or if any operation failed.
+\end{enumerate}
+
+For each run, the simulator is also run alone over the same trace window with the same policy, which gives a \emph{simulator reference}. \emph{Action agreement} is the fraction of steps on which the emulated and simulated actions are identical.
+
+\paragraph{Equivalence check.} The backend can run with the network replaced by a stub that returns the trace row as the measured load. In that mode, over 300 steps with all four policies in both observation modes, the pipeline reproduced the simulator exactly: 100\% action agreement and identical metrics. Any difference observed in E4 is therefore caused by measurement on the emulated network, not by the integration code. Fifteen unit tests and three smoke tests (single switch, three-switch line and full OS3E) also pass (Appendix~\ref{app:mininet}).
+
+\subsection{Runs, models and metrics}
+
+The E1 OS3E models (current RDQN and GRU-RDQN, synthetic training) and the E3 seed-42 models (Abilene training) were used, together with the three baselines. Emulation runs in real time (about 65 minutes for four policies over 150 intervals), so three 150-step windows were chosen to contain load changes that require decisions (Table~\ref{tab:mn-windows}). Windows in which the load barely changes would only test the no-op action. Each window was run once in current mode and once in predictive mode, giving 6 runs, 24 policy runs and 3,600 emulated decision intervals. Random-valid used evaluation seed 1042. A 150-step window is shorter than the 500-step episodes of E1--E3, so E4 rewards are not comparable with the rewards reported for those protocols.
+
+\begin{table}[htbp]
+\centering
+\caption{E4 trace windows (150 steps each) and the models used.}
+\label{tab:mn-windows}
+\small
+\begin{tabularx}{\textwidth}{@{}p{3.3cm}p{3.3cm}Lp{3.4cm}@{}}
+\toprule
+\textbf{Window} & \textbf{Trace} & \textbf{Load pattern (mean switch load)} & \textbf{Models}\\
+\midrule
+Synthetic 72--221 & E1 synthetic OS3E test split & Gradual fall from 0.94 to about 0.48 & E1 current RDQN, GRU-RDQN\\
+Synthetic 600--749 & E1 synthetic OS3E test split & Quiet period near 0.23, then a surge to 0.97 & E1 current RDQN, GRU-RDQN\\
+Abilene 5250--5399 & E3 Abilene test (\texttt{X21}--\texttt{X24}) & Varying, 0.32--0.71; the most variable part of the test weeks & E3 seed-42 current RDQN, GRU-RDQN\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Table~\ref{tab:mn-metrics} separates what E4 measures from what it still takes from the simulator's models. All controllers share one computer, so the control channel has no geographic delay. Moreover, the forwarding rules installed by every controller are identical, so moving a switch to another controller does not change how its packets are forwarded. Data-plane metrics therefore describe the traffic, not the policy, and are reported to show that the emulated network behaves realistically.
+
+\paragraph{Noise-robustness test.} To check whether the remaining differences between emulation and simulation are caused by measurement error, each window was replayed eight times without the network. In each replay, Gaussian noise with standard deviation 0.001 was added to every load. This is about the size of the measured calibration error. Each replay used a different noise seed, and the spread of the resulting rewards was recorded.
+
+\begin{table}[htbp]
+\centering
+\caption{E4 metrics: measured on the emulated network versus taken from the simulator's models.}
+\label{tab:mn-metrics}
+\small
+\begin{tabularx}{\textwidth}{@{}p{4.2cm}L@{}}
+\toprule
+\textbf{Metric} & \textbf{Source and meaning}\\
+\midrule
+Calibration error & Measured: mean absolute difference between measured and trace switch loads\\
+Action agreement & Share of steps on which the emulated action equals the simulator-reference action\\
+Handover time & Measured: from \texttt{set-controller} until the new controller has confirmed the flow rules\\
+Flow-install time & Measured: from switch connection until the barrier reply\\
+Controller start / stop time & Measured: until the new process accepts connections / the process has exited\\
+Failed operations, inconsistent steps & Measured: failed network operations; steps whose OVSDB mapping differs from the intended mapping\\
+Loss, jitter, throughput, RTT & Measured by iperf3 and ping (data plane; identical rules under every policy)\\
+Controller CPU and memory & Measured from the operating system for every controller process\\
+Reward, energy, controller--switch latency & \emph{Modelled}: computed by the unchanged environment from the measured loads and the real mapping\\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -179,7 +272,7 @@ Evaluation & $6\times500$, seed 2042 & $6\times500$, seed 2042 & $6\times500$, s
 \section{Evaluation Criteria and Performance Metrics}
 \label{sec:metrics}
 
-Metrics are recorded at every evaluation step and aggregated as in Table~\ref{tab:metrics}. Cumulative reward is the primary criterion because it is the objective the agent optimises and it combines all three costs. Individual metrics are reported alongside it so that trade-offs are visible: a policy can improve the reward while losing on one metric. Rewards are comparable only within one protocol and observation mode, because the traffic and valid action sets differ between them.
+Metrics are recorded at every evaluation step and aggregated as in Table~\ref{tab:metrics}; the additional emulation metrics of E4 are listed in Table~\ref{tab:mn-metrics}. Cumulative reward is the primary criterion because it is the objective the agent optimises and it combines all three costs. Individual metrics are reported alongside it so that trade-offs are visible: a policy can improve the reward while losing on one metric. Rewards are comparable only within one protocol and observation mode, because the traffic and valid action sets differ between them.
 
 \begin{table}[htbp]
 \centering

@@ -1,7 +1,7 @@
 \chapter{Results and Discussion}
 \label{ch:results}
 
-This chapter reports the final held-out results of the three protocols (E1--E3, Table~\ref{tab:protocols}), compares the approach with existing methods, presents ablations and supporting analyses, and discusses what the evidence does and does not show. Unless stated otherwise, values are means over the six evaluation episodes; reward is per 500-step episode. Complete tables, including action counts, are given in Appendix~\ref{app:tables}.
+This chapter reports the final held-out results of the three simulation protocols (E1--E3, Table~\ref{tab:protocols}) and the Mininet emulation validation (E4), compares the approach with existing methods, presents ablations and supporting analyses, and discusses what the evidence does and does not show. Unless stated otherwise, values for E1--E3 are means over the six evaluation episodes, with reward per 500-step episode; E4 rewards are per 150-step window. Complete tables, including action counts, are given in Appendix~\ref{app:tables}.
 
 \section{Overall Experimental Results}
 \label{sec:overall}
@@ -231,6 +231,97 @@ Averaged over seeds, predictive GRU-RDQN achieved a better reward ($+10.61$), sl
 
 Validation for E3 (Appendix~\ref{app:tables}) took place in an almost overload-free period ($\le0.2$\% of steps) in which all active policies were within about 2.5 reward points of each other. That validation period could not separate the models, and this probably contributes to the seed-to-seed variability of the selected checkpoints.
 
+\subsection{E4: Emulation validation in Mininet}
+\label{sec:res-mininet}
+
+E4 runs the E1 and E3 OS3E policies, unchanged, on the emulated network of Section~\ref{sec:mininet-setup}. Table~\ref{tab:mn-results} gives the emulated reward of every policy, with the simulator reference and the action agreement for the learned policy; the complete results are in Appendix~\ref{app:mininet}. Figure~\ref{fig:mininet} summarises fidelity, robustness and data-plane behaviour.
+
+\begin{table}[htbp]
+\centering
+\caption{E4 emulated results per run (150 steps). ``Learned'' is current RDQN in current mode and GRU-RDQN in predictive mode. Sim is the simulator reference on the same window; Agr.\ is action agreement between emulation and simulator. Energy and evokes are for the learned and threshold policies. Best emulated reward per run in bold.}
+\label{tab:mn-results}
+\small
+\fitwidth{\begin{tabular}{@{}llrrrrrrrr@{}}
+\toprule
+& & \multicolumn{3}{c}{\textbf{Learned}} & \multicolumn{3}{c}{\textbf{Baselines (emulated reward)}} & \textbf{Energy (W)} & \textbf{Evokes}\\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-9}\cmidrule(lr){10-10}
+\textbf{Window} & \textbf{Mode} & Mininet & Sim & Agr.\,\% & Threshold & Random & No-op & L / T & L / T\\
+\midrule
+Synthetic 72--221  & Current    & $-$68.90 & $-$68.93 & 93.3 & \textbf{$-$67.75} & $-$78.87 & $-$77.77 & 487.0 / 485.2 & 2 / 2\\
+                   & Predictive & \textbf{$-$62.00} & $-$62.00 & 100.0 & $-$75.59 & $-$82.67 & $-$77.78 & 395.8 / 485.8 & 1 / 2\\
+\midrule
+Synthetic 600--749 & Current    & $-$78.69 & $-$78.69 & 100.0 & \textbf{$-$77.31} & $-$85.61 & $-$132.73 & 284.2 / 287.8 & 4 / 4\\
+                   & Predictive & \textbf{$-$60.29} & $-$60.29 & 100.0 & $-$85.78 & $-$93.94 & $-$132.74 & 217.0 / 287.8 & 1 / 4\\
+\midrule
+Abilene 5250--5399 & Current    & \textbf{$-$85.18} & $-$154.72 & 85.3 & $-$88.86 & $-$194.95 & $-$139.71 & 366.4 / 430.0 & 6 / 10\\
+                   & Predictive & \textbf{$-$71.99} & $-$71.99 & 100.0 & $-$101.51 & $-$194.95 & $-$138.91 & 296.2 / 437.8 & 1 / 5\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{mininet_validation}
+  \caption{E4 summary. (a) Emulated versus simulated reward for all 24 policy runs; points on the dashed line agree exactly. (b) Reward of the learned policy in eight replays with load noise of standard deviation 0.001 (S = synthetic, A = Abilene window). (c) UDP loss against total offered load in every emulated interval.}
+  \label{fig:mininet}
+\end{figure}
+
+\paragraph{Fidelity.} The measured switch loads differed from the trace by 0.0007 on average (95th percentile 0.0016) over all 3,600 intervals. In 18 of the 24 policy runs, every emulated action was identical to the simulator's, and the rewards differed by at most 0.80, caused by one step whose measured load sat exactly on the underload threshold. The mean agreement over all runs was 97.4\%. The six runs with lower agreement (81--95\%) all diverge first at a \emph{near-tie}: for example, two candidate switches whose loads differ by less than 0.005, so that a measurement difference of a few thousandths changes which one is migrated. After such a step the controller mapping differs and later decisions follow a different path. Figure~\ref{fig:mininet}(a) shows that the points nevertheless lie on or close to the diagonal, with one exception discussed next.
+
+\paragraph{The divergent run.} Current RDQN on the Abilene window scored $-85.18$ in emulation but $-154.72$ in the simulator. The two runs were identical for 58 steps. At step 59 a near-tied migration went the other way, and on the simulator's path the policy reached a state with five active controllers, one overloaded and two underloaded, in which it chose no-op for about 40 consecutive steps at the minimum reward. The emulated path avoided that state. The emulated score is therefore not a property of the emulator but evidence that current RDQN is sensitive to tiny input changes in this window, which the noise test below confirms.
+
+\paragraph{Learned versus baseline policies in emulation.} GRU-RDQN had the best reward in all three predictive-mode runs, ahead of the threshold policy by 13.6, 25.5 and 29.5 points. It used 18.5--32.3\% less energy than threshold control, mainly because it evoked a controller once per run instead of two to five times, and its overload fraction was equal to or within two percentage points of threshold control's. On the synthetic surge window it evoked once, whereas the threshold and random-valid policies evoked four times and parked twice. In current mode the picture is closer: current RDQN and threshold control were within 1.4 points on both synthetic windows, and current RDQN's emulated lead on the Abilene window comes from the favourable divergence described above. These are single 150-step windows, so they illustrate rather than replace the held-out comparisons of E1--E3. They are consistent with E1, where GRU-RDQN was the selected and best OS3E policy. On the Abilene trace, E3 found the two modes indistinguishable over full test weeks and three seeds, so the clear predictive advantage in this one window should not be generalised.
+
+\paragraph{Robustness to measurement noise.} Table~\ref{tab:mn-noise} and Figure~\ref{fig:mininet}(b) give the rewards of eight replays of each window with load noise of standard deviation 0.001. GRU-RDQN's reward varied by at most 0.04 in every window and mode. Current RDQN was equally stable on the two synthetic windows, but on the Abilene window its reward took three distinct outcomes between $-154.72$ and $-38.97$ (five of the eight replays gave about $-154.7$, one gave the emulated $-85.18$ and two gave $-38.97$). Threshold control varied by up to 18.3 points. In this experiment the forecast input therefore made the learned policy's decisions markedly more stable under measurement error, which matters for deployment because measured loads are never exact.
+
+\begin{table}[htbp]
+\centering
+\caption{Noise robustness: range of reward over eight replays per window with Gaussian load noise ($\sigma=0.001$). Spread is maximum minus minimum.}
+\label{tab:mn-noise}
+\small
+\fitwidth{\begin{tabular}{@{}llrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{\textbf{Learned policy}} & \multicolumn{2}{c}{\textbf{Threshold}}\\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+\textbf{Window} & \textbf{Mode} & Range & Spread & Range & Spread\\
+\midrule
+Synthetic 72--221  & Current    & $-$68.93 to $-$67.97 & 0.96 & $-$71.88 to $-$67.76 & 4.12\\
+                   & Predictive & $-$62.04 to $-$62.00 & 0.04 & $-$77.11 to $-$75.46 & 1.65\\
+Synthetic 600--749 & Current    & $-$78.71 to $-$78.69 & 0.02 & $-$77.31 & 0.00\\
+                   & Predictive & $-$60.29 & 0.00 & $-$85.78 & 0.00\\
+Abilene 5250--5399 & Current    & $-$154.72 to $-$38.97 & 115.75 & $-$107.16 to $-$88.86 & 18.30\\
+                   & Predictive & $-$71.99 & 0.00 & $-$101.72 to $-$84.47 & 17.25\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Cost of carrying out decisions.} Table~\ref{tab:mn-costs} reports the measured cost of every network operation, pooled over all runs. All 687 operations succeeded and no step was inconsistent, so the mapping on the switches always matched the policy's intended mapping. A switch handover took 40\,ms on average, of which about 9\,ms was rule installation, and a controller start took 0.65\,s, which is well within one 5\,s decision interval. Handovers were slower when the policy itself ran a neural network on the same CPU: in current mode 33\,ms for threshold and random-valid control against 48\,ms for RDQN, and 41--44\,ms for every policy in predictive mode, where the GRU runs at every step. This overhead comes from sharing one computer and would not occur with the agent on a separate host. Each controller process used about 0.3\% of one CPU core and 59\,MB of memory.
+
+\begin{table}[htbp]
+\centering
+\caption{E4 measured costs, pooled over all 24 policy runs (3,600 intervals). Handovers include switches moved by migrate actions and switches reassigned when a controller is parked.}
+\label{tab:mn-costs}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Measurement} & \textbf{$n$} & \textbf{Mean} & \textbf{95th pct.} & \textbf{Max}\\
+\midrule
+Switch handover (ms) & 578 & 39.9 & 60.2 & 66.6\\
+\quad of which flow installation (ms) & 578 & 9.0 & 16.2 & 19.7\\
+Controller start, evoke (ms) & 65 & 651.6 & 708.2 & 759.8\\
+Controller stop, park (ms) & 44 & 9.7 & 15.9 & 16.1\\
+Calibration error (load units) & 3,600 & 0.0007 & 0.0016 & 0.0044\\
+Controller CPU (\% of one core) & 11,244 & 0.30 & 0.86 & 1.72\\
+Controller memory (MB) & 11,244 & 59.4 & 59.8 & 59.9\\
+\bottomrule
+\end{tabular}
+\par\smallskip\footnotesize Network operations: 687 attempted, 0 failed. Inconsistent steps: 0 of 3,600. Network set-up: 39.0\,s per run.
+\end{table}
+
+\paragraph{Data plane.} The emulated network carried the replayed traffic with a mean RTT of 19.7\,ms (95th percentile 30.2\,ms) and jitter of 0.6\,ms. Loss was negligible at moderate load but rose roughly linearly once the total offered load exceeded about 300--350\,Mb/s, reaching 22.7\% at 650\,Mb/s (Figure~\ref{fig:mininet}(c)), because several shortest paths share the same 100\,Mb/s core links. The mean loss was 5.8\%. Loss and RTT were the same for every policy within a run, as expected: every controller installs the same proactive rules, so controller management changes the control plane, not packet forwarding. The GRU forecast measured against the measured loads had a mean absolute error of 0.046--0.058 on the synthetic windows and 0.128 on the Abilene window.
+
+\paragraph{Summary of E4.} The learned policies run unchanged on an OpenFlow data plane with separate controller processes, every decision they make can be carried out (no failed operation in 3,600 intervals), and their decisions match the simulator except where a near-tie lets a measurement difference of a few thousandths change the path. GRU-RDQN matched the simulator exactly, was the best policy in every predictive-mode run and was insensitive to measurement noise. Energy and controller--switch latency in E4 are still model values, and the data-plane metrics do not depend on the policy, so E4 validates executability, measurement fidelity and action cost rather than a data-plane benefit.
+
 \section{Comparison with Existing Methods}
 \label{sec:compare-existing}
 
@@ -248,7 +339,7 @@ The comparison that can be made is methodological (Table~\ref{tab:litcompare}). 
   \item \textbf{A matched forecast ablation.} Unlike forecast-assisted placement~\cite{li2024mec}, the same agent is trained with and without forecasts, which shows that the forecast's value depends on the topology and the traffic.
   \item \textbf{Evaluation discipline.} The study uses chronological splits, a single-use test set, baselines run under identical conditions, a zero-shot transfer test and multi-seed replication, as recommended for credible DRL evaluation~\cite{henderson2018matters,agarwal2021precipice}.
 \end{itemize}
-Conversely, those works include elements not covered here: controller placement itself, a real controller platform (ONOS in DDCP), formal safety layers~\cite{dinh2025safe} and multi-domain federated training~\cite{jha2026federated}.
+Conversely, those works include elements not covered here: controller placement itself, a production controller platform (ONOS in DDCP; this work used os-ken controllers in a single-host emulation), formal safety layers~\cite{dinh2025safe} and multi-domain federated training~\cite{jha2026federated}.
 
 \section{Ablation Studies and Additional Analyses}
 \label{sec:ablation}
@@ -294,7 +385,7 @@ With 80k steps, Cogentco current RDQN \emph{lost} on validation to no-op ($-538.
 
 \subsection{Action behaviour and validity}
 
-Across all reported final tests, both learned and baseline policies had \textbf{zero failed actions}, which confirms that the valid-action mask and feasibility checks work as intended. On synthetic traffic the learned policies performed 1.7--2.8 parks, 1.5--3.2 evokes and 24--57 migrations per 500-step episode, and took no action in the remaining 87--95\% of steps (Appendix~\ref{app:tables}). Compared with threshold control, they evoked less often on the large topologies; on Interoute, 1.7 versus 2.8 evokes per episode with fewer migrations, which explains most of the energy difference. The policies therefore learned \emph{when not to add capacity}, a judgement a fixed rule cannot make.
+Across all reported final tests, both learned and baseline policies had \textbf{zero failed actions}, which confirms that the valid-action mask and feasibility checks work as intended. In emulation (E4), the 687 resulting network operations also all succeeded on the real switches and controller processes. On synthetic traffic the learned policies performed 1.7--2.8 parks, 1.5--3.2 evokes and 24--57 migrations per 500-step episode, and took no action in the remaining 87--95\% of steps (Appendix~\ref{app:tables}). Compared with threshold control, they evoked less often on the large topologies; on Interoute, 1.7 versus 2.8 evokes per episode with fewer migrations, which explains most of the energy difference. The policies therefore learned \emph{when not to add capacity}, a judgement a fixed rule cannot make.
 
 \subsection{Implementation verification}
 
@@ -307,14 +398,17 @@ Before any final experiment, an audit of an earlier version of the code found tw
 
 \paragraph{Objective O2 (learning and fair evaluation).} On held-out synthetic traffic, Rainbow DQN learned controller-management policies that beat threshold, random-valid and no-op control in reward on all five topologies. The main mechanism is energy-aware restraint: keeping fewer controllers active, adding capacity only when it pays off, and still resolving overload by migration. The cost is a small increase in average latency on most topologies. This is the trade-off the reward was designed to make, not a defect, but a deployment that prioritises latency would need different weights.
 
-\paragraph{Objective O3 (forecasting).} Forecasting helped where the forecaster was accurate \emph{and} the policy used it. OS3E had the most forecast-only actions and the largest gain. It did not help on Gridnet and BellCanada despite good forecasts, which suggests that the extra 15--54 state dimensions made learning harder within the same 80k-step budget. On real traffic the evidence was neutral: averaged over three seeds predictive mode was ahead, but one seed drove that difference. The answer to O3 is therefore conditional: \emph{a GRU forecast can make controller management more proactive and more energy-efficient, but its benefit depends on the topology, the forecast quality and the traffic regime, and it is not universal.}
+\paragraph{Objective O3 (forecasting).} Forecasting helped where the forecaster was accurate \emph{and} the policy used it. OS3E had the most forecast-only actions and the largest gain. It did not help on Gridnet and BellCanada despite good forecasts, which suggests that the extra 15--54 state dimensions made learning harder within the same 80k-step budget. On real traffic the evidence was neutral: averaged over three seeds predictive mode was ahead, but one seed drove that difference. In emulation, the forecast had a second, unplanned benefit: GRU-RDQN's decisions were insensitive to small measurement errors, whereas current RDQN's were not on the Abilene window. The answer to O3 is therefore conditional: \emph{a GRU forecast can make controller management more proactive and more energy-efficient, but its benefit depends on the topology, the forecast quality and the traffic regime, and it is not universal.}
+
+\paragraph{Objective O4 (emulation validation).} The OS3E policies ran unchanged on Mininet with Open vSwitch and five os-ken controller processes. Measured loads matched the trace to within 0.001, every one of the 687 resulting network operations succeeded, and the emulated decisions matched the simulator in 18 of 24 policy runs and on 97.4\% of steps overall. The differences arose only at near-ties. A switch handover costs about 40\,ms and a controller start about 0.65\,s, both small compared with a 5\,s decision interval. The simulator is therefore a faithful stand-in for the control loop it models, and the learned actions are executable on a real OpenFlow data plane. E4 does not show that the policies improve packet-level performance, because with identical proactive rules the data plane does not depend on which controller manages a switch.
 
 \paragraph{Limitations and threats to validity.}
 \begin{itemize}[leftmargin=*]
   \item \emph{Construct validity.} Latency is graph propagation delay only; queueing and controller processing delay are not modelled. Energy is a three-level state model. Controller capacity is represented by fixed normalised thresholds.
-  \item \emph{External validity.} The synthetic generator, although stress-oriented and topology-scaled, is not operator traffic. The real-traffic study maps 12 Abilene nodes onto 34 OS3E switches through a fixed projection and covers one topology. No OpenFlow controller or Mininet deployment was used.
+  \item \emph{External validity.} The synthetic generator, although stress-oriented and topology-scaled, is not operator traffic. The real-traffic study maps 12 Abilene nodes onto 34 OS3E switches through a fixed projection and covers one topology.
   \item \emph{Statistical validity.} The synthetic results use one training seed, and E3 uses three. Within-evaluation reward variance is large, and per-window results were not stored for paired testing. No significance claims are made.
   \item \emph{Internal validity.} Selection decisions used validation data only, and test splits were used once. The Cogentco 120k model lacks a recorded validation run, and E3 validation was too quiet to discriminate between models. The reward weights and thresholds were fixed by design and not tuned, and their sensitivity is untested.
+  \item \emph{Emulation validity.} E4 used one topology (OS3E), three 150-step windows and a single computer. All controllers share that computer, so control-channel delay is not emulated, and energy and controller--switch latency remain model values. os-ken is a lightweight controller rather than a production platform such as ONOS. Because every controller installs the same proactive rules, data-plane loss and RTT do not respond to the policy.
   \item \emph{Scalability.} A separate agent is trained per topology, and the flat action space grows with $N$, which makes training on large networks expensive on CPU.
 \end{itemize}
 These limitations bound the claims made in this report. They do not undermine the central result, which rests on matched comparisons inside a single, documented environment.

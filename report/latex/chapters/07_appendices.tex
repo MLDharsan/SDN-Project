@@ -101,6 +101,51 @@ A systematic audit (June 2026) of the first working version identified the defec
 
 All figures in this report were regenerated from the frozen CSV files by \path{report/scripts/make_report_figures.py}, which selects each row by \emph{(topology, policy)}. The earlier project script \path{experiments/plot_final_results.py} selects rows by policy only. When it reads the multi-topology CSV, it therefore plots Gridnet's values for BellCanada and Interoute in the synthetic figures under \path{results/final_figures/synthetic/}. Those older synthetic figures should not be used. The real-case-study figures and the three-seed aggregate CSV are unaffected, because each of their source files contains a single topology. No result values or tables are affected; only those plots are.
 
+\chapter{Emulation Validation Details}
+\label{app:mininet}
+
+\section{Emulation settings}
+
+\begin{table}[H]
+\centering
+\caption{Settings of the E4 Mininet emulation (\texttt{configs/mininet\_os3e.json}).}
+\label{tab:app-mn-settings}
+\small
+\begin{tabularx}{\textwidth}{@{}p{4.6cm}L@{}}
+\toprule
+\textbf{Setting} & \textbf{Value}\\
+\midrule
+Topology & OS3E from the simulator's topology loader: 34 switches, 36 links, two components (28 + 6 switches); one host per switch\\
+Links & 100\,Mb/s (HTB shaping), geographic propagation delay (netem), queue 1,000 packets\\
+Switches & Open vSwitch 3.3.9, OpenFlow 1.3, fail mode \emph{secure}, static ARP, IPv6 disabled\\
+Controllers & os-ken 3.1.1; $c_1$--$c_5$ on TCP ports 6653--6657 (127.0.0.1); 3 active and 2 parked at start; parked = process stopped\\
+Forwarding & Proactive per-destination-IP shortest-path rules (by delay); table-miss drop; barrier confirms installation\\
+Traffic replay & UDP iperf3, rate $20\,x_{i,t}$\,Mb/s (minimum 0.05), 1,200-byte payload, 42-byte header overhead; partner $(i+17)$ within the component\\
+Interval & 5\,s per decision; measurement from 1.0\,s after traffic start to 0.3\,s before its end\\
+Load measurement & One read of \path{/proc/net/dev} per snapshot; host-port receive bytes, header overhead removed, divided by 20\,Mb/s\\
+Probes & Ping between 4 host pairs, 3 packets per interval\\
+Timeouts & Controller start-up 20\,s; switch handover 10\,s\\
+Runs & 150 steps per run; evaluation seed 1042; policies RDQN, threshold, random-valid, no-op\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Complete E4 results}
+
+\input{chapters/07b_mininet_tables}
+
+\section{Verification of the emulation backend}
+
+The package \path{mininet_integration/} modifies no existing file. Before it was written, a SHA-256 checksum list of 387 project files was recorded, covering the environment, experiment, forecasting and utility code, the trained models, the traffic data and the stored results. After all E4 runs, every one of those checksums was unchanged; the only files that differ are the sources of this report, the project diary and the repository's ignore list. The eight regression tests of Table~\ref{tab:app-tests} still pass. The emulation backend has its own fifteen unit tests (\path{mininet_integration/tests/test_mininet_integration.py}), all of which pass:
+\begin{itemize}[leftmargin=*]
+  \item the Mininet topology has the simulator's dimensions and node order, every route is loop-free and reaches its destination, no route crosses between disconnected components, and the topology description survives a JSON round trip;
+  \item traffic partners form a permutation within each component, rates and history padding match the simulator, and the iperf3, ping and interface-counter parsers are correct, including removal of header overhead;
+  \item with exact loads, the shadow environment reproduces the simulator step by step for threshold, random-valid and current RDQN, and for GRU-RDQN in predictive mode;
+  \item output can only be written inside \path{mininet_results/};
+  \item a real os-ken process accepts a simulated OpenFlow 1.3 switch, installs its routes and reports them as ready.
+\end{itemize}
+Three smoke tests on the real network also passed before the experiments: a single switch with two hosts (0\% loss), a three-switch line (calibration error 0.000, handover 16.5\,ms) and the full OS3E network (786 of 786 pings delivered, calibration error 0.001, handover 34\,ms). A 300-step run with the network replaced by exact loads reproduced the simulator exactly for all four policies in both modes.
+
 \chapter{Reproducibility}
 \label{app:repro}
 
@@ -146,9 +191,24 @@ python experiments/evaluate_real_traffic_zero_shot.py \
   --observation-mode predictive --episodes 6 \
   --steps-per-episode 500 --seed 2042
 
-# 6. Report figures and appendix tables (read-only on results)
+# 6. Mininet emulation (E4); needs root for Mininet/OVS
+python -m unittest mininet_integration.tests.test_mininet_integration -v
+sudo venv/bin/python -m mininet_integration.smoke_test --topo os3e \
+  --traffic --migrate
+for mode in current predictive; do
+  sudo venv/bin/python -m mininet_integration.run_mininet_experiment \
+    --start-index 600 --steps 150 --mode $mode \
+    --run-name syn_w600_$mode
+  sudo venv/bin/python -m mininet_integration.run_mininet_experiment \
+    --profile real_case_study --start-index 5250 --steps 150 \
+    --mode $mode --run-name real_w5250_$mode
+done   # window 72-221: --start-index 72 (synthetic profile)
+# noise test (no root): add --dry-run --dry-run-noise 0.001 --seed S
+
+# 7. Report figures and appendix tables (read-only on results)
 python report/scripts/make_report_figures.py
 python report/scripts/make_appendix_tables.py
+python report/scripts/make_mininet_results.py
 \end{lstlisting}
 
 \paragraph{Primary result files.}
@@ -160,5 +220,6 @@ python report/scripts/make_appendix_tables.py
   \item \path{results/real_case_study/zero_shot_os3e_current/fair_eval_20261107_111507.csv}
   \item \path{results/real_case_study/zero_shot_os3e/fair_eval_20261028_212001.csv}
   \item \path{results/real_case_study/{final,replications/seed_4*/final\}\_\{current,predictive\}/}
+  \item \path{mininet_results/} (E4): \path{20261121_131444_os3e_synthetic_current}, \path{20261121_142455_os3e_synthetic_predictive}, \path{syn_w600_{current,predictive}}, \path{real_w5250_{current,predictive}} and \path{noise_robustness_*}; each run folder holds \path{run_info.json} with the git commit and SHA-256 hashes of the model and trace files
 \end{itemize}
 \par\endgroup

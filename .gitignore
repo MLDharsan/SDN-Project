@@ -5,13 +5,13 @@ venv/
 results/
 experiments/results/
 logs/
-topologies/
+/topologies/
 traffic/
 tests/__pycache__/
 tests/*.log
 models/
 tensorboard/
-utils
+reports/
 *.log
 *.csv
 *.json
@@ -41,3 +41,7 @@ GRU_PREDICTIVE_IMPLEMENTATION_*.md
 # Mininet backend: run outputs and local symlink
 mininet_results/
 mininet_integration/_vendor/
+
+# Unused helper scripts (kept locally, not committed)
+utils/traffic_loader.py
+utils/archive_and_clean_results.py
